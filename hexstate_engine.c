@@ -294,6 +294,7 @@ int init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits)
         c->hilbert.q_entangle_seed = 0;
         c->hilbert.q_basis_rotation = 0;
         c->hilbert.q_joint_state = NULL;
+        c->hilbert.q_joint_dim = 0;
         c->hilbert.q_partner = 0;
         c->hilbert.q_which = 0;
 
@@ -666,7 +667,14 @@ void grover_diffusion(HexStateEngine *eng, uint64_t id)
 void braid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b,
                   uint64_t hexit_a, uint64_t hexit_b)
 {
+    braid_chunks_dim(eng, a, b, hexit_a, hexit_b, 6);
+}
+
+void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
+                      uint64_t hexit_a, uint64_t hexit_b, uint32_t dim)
+{
     if (a >= eng->num_chunks || b >= eng->num_chunks) return;
+    if (dim == 0) dim = 6;
 
     /* Grow braid links array if needed */
     if (eng->num_braid_links >= eng->braid_capacity) {
@@ -707,14 +715,17 @@ void braid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b,
         }
 
         /* Allocate joint state in Hilbert space */
-        Complex *joint = calloc(36, sizeof(Complex));
-        double amp = 1.0 / sqrt(6.0);
-        for (int k = 0; k < 6; k++)
-            joint[k * 6 + k] = cmplx(amp, 0.0);  /* |k⟩_A |k⟩_B */
+        uint64_t joint_size = (uint64_t)dim * dim;
+        Complex *joint = calloc(joint_size, sizeof(Complex));
+        double amp = 1.0 / sqrt((double)dim);
+        for (uint32_t k = 0; k < dim; k++)
+            joint[k * dim + k] = cmplx(amp, 0.0);  /* |k⟩_A |k⟩_B */
 
         /* WRITE to both Magic Pointer addresses */
         eng->chunks[a].hilbert.q_joint_state = joint;
         eng->chunks[b].hilbert.q_joint_state = joint;
+        eng->chunks[a].hilbert.q_joint_dim = dim;
+        eng->chunks[b].hilbert.q_joint_dim = dim;
         eng->chunks[a].hilbert.q_partner = b;
         eng->chunks[b].hilbert.q_partner = a;
         eng->chunks[a].hilbert.q_which = 0;  /* A side */
@@ -722,8 +733,9 @@ void braid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b,
         eng->chunks[a].hilbert.q_flags = 0x01;  /* superposed */
         eng->chunks[b].hilbert.q_flags = 0x01;  /* superposed */
 
-        printf("  [BRAID] Bell state |Ψ⟩=(1/√6)Σ|k⟩|k⟩ WRITTEN to Hilbert space\n"
+        printf("  [BRAID] Bell state |Ψ⟩=(1/√%u)Σ|k⟩|k⟩ WRITTEN to Hilbert space (dim=%u, %lu bytes)\n"
                "          Ptr 0x%016lX (A) <-> Ptr 0x%016lX (B)\n",
+               dim, dim, joint_size * sizeof(Complex),
                eng->chunks[a].hilbert.magic_ptr,
                eng->chunks[b].hilbert.magic_ptr);
     } else {
@@ -873,6 +885,7 @@ int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
     c->hilbert.q_entangle_seed = 0;
     c->hilbert.q_basis_rotation = 0;
     c->hilbert.q_joint_state = NULL;
+    c->hilbert.q_joint_dim = 0;
     c->hilbert.q_partner = 0;
     c->hilbert.q_which = 0;
 
