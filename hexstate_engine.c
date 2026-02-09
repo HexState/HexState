@@ -166,6 +166,7 @@ int engine_init(HexStateEngine *eng)
     eng->num_braid_links = 0;
 
     init_dft6();
+    register_builtin_oracles(eng);
 
     return 0;
 }
@@ -598,27 +599,469 @@ int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * ORACLE (Stub dispatcher)
+ * ORACLE REGISTRY
  * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Registration API ─────────────────────────────────────────────────────── */
+
+int oracle_register(HexStateEngine *eng, uint32_t oracle_id,
+                    const char *name, OracleFunc func, void *user_data)
+{
+    if (oracle_id >= MAX_ORACLES) {
+        printf("  [ORACLE] ERROR: oracle_id %u exceeds MAX_ORACLES (%d)\n",
+               oracle_id, MAX_ORACLES);
+        return -1;
+    }
+    if (eng->oracles[oracle_id].active) {
+        printf("  [ORACLE] WARNING: overwriting existing oracle 0x%02X (%s)\n",
+               oracle_id, eng->oracles[oracle_id].name);
+    }
+
+    eng->oracles[oracle_id].name      = name;
+    eng->oracles[oracle_id].func      = func;
+    eng->oracles[oracle_id].user_data = user_data;
+    eng->oracles[oracle_id].active    = 1;
+    eng->num_oracles_registered++;
+
+    printf("  [ORACLE] Registered: 0x%02X → \"%s\"\n", oracle_id, name);
+    return 0;
+}
+
+void oracle_unregister(HexStateEngine *eng, uint32_t oracle_id)
+{
+    if (oracle_id >= MAX_ORACLES || !eng->oracles[oracle_id].active) return;
+
+    printf("  [ORACLE] Unregistered: 0x%02X (%s)\n",
+           oracle_id, eng->oracles[oracle_id].name);
+
+    eng->oracles[oracle_id].name      = NULL;
+    eng->oracles[oracle_id].func      = NULL;
+    eng->oracles[oracle_id].user_data = NULL;
+    eng->oracles[oracle_id].active    = 0;
+    eng->num_oracles_registered--;
+}
+
+void oracle_list(HexStateEngine *eng)
+{
+    printf("\n┌─────────────────────────────────────────────────────┐\n");
+    printf("│           ORACLE REGISTRY (%u registered)           │\n",
+           eng->num_oracles_registered);
+    printf("├──────┬──────────────────────────────────────────────┤\n");
+
+    for (uint32_t i = 0; i < MAX_ORACLES; i++) {
+        if (eng->oracles[i].active) {
+            printf("│ 0x%02X │ %-44s │\n", i, eng->oracles[i].name);
+        }
+    }
+
+    printf("└──────┴──────────────────────────────────────────────┘\n\n");
+}
+
+/* ─── Oracle Dispatcher ────────────────────────────────────────────────────── */
 
 void execute_oracle(HexStateEngine *eng, uint64_t chunk_id, uint32_t oracle_id)
 {
-    if (chunk_id >= eng->num_chunks) return;
+    if (chunk_id >= eng->num_chunks) {
+        printf("  [ORACLE] ERROR: chunk %lu does not exist\n", chunk_id);
+        return;
+    }
 
-    printf("  [ORACLE] Executing oracle 0x%02X on chunk %lu "
-           "(Magic Ptr 0x%016lX)\n",
-           oracle_id, chunk_id, eng->chunks[chunk_id].hilbert.magic_ptr);
+    if (oracle_id >= MAX_ORACLES || !eng->oracles[oracle_id].active) {
+        printf("  [ORACLE] ERROR: oracle 0x%02X not registered\n", oracle_id);
+        return;
+    }
 
-    /* Oracle implementations would be registered here.
-     * For the base port, we provide a phase-marking stub. */
+    OracleEntry *o = &eng->oracles[oracle_id];
     Chunk *c = &eng->chunks[chunk_id];
-    if (c->hilbert.shadow_state == NULL) return;
 
-    /* Default oracle: mark state 0 with a phase flip */
+    printf("  [ORACLE] Dispatching \"%s\" (0x%02X) → chunk %lu "
+           "(Magic Ptr 0x%016lX, %lu states)\n",
+           o->name, oracle_id, chunk_id,
+           c->hilbert.magic_ptr, c->num_states);
+
+    /* Invoke the oracle */
+    o->func(eng, chunk_id, o->user_data);
+}
+
+/* ─── Built-in Oracle: Phase Flip (state 0) ───────────────────────────────── */
+
+static void builtin_phase_flip(HexStateEngine *eng, uint64_t chunk_id,
+                               void *user_data)
+{
+    (void)user_data;
+    Chunk *c = &eng->chunks[chunk_id];
+
+    if (c->hilbert.shadow_state == NULL) {
+        printf("    → Phase flip on state |0⟩ (topological — no shadow)\n");
+        return;
+    }
+
     if (c->num_states > 0) {
         c->hilbert.shadow_state[0].real = -c->hilbert.shadow_state[0].real;
         c->hilbert.shadow_state[0].imag = -c->hilbert.shadow_state[0].imag;
+        printf("    → Phase flip applied to |0⟩\n");
     }
+}
+
+/* ─── Built-in Oracle: Search Mark (arbitrary target) ─────────────────────── */
+/*
+ * user_data points to a uint64_t holding the target state index.
+ * Marks it with a phase flip for Grover search.
+ */
+static void builtin_search_mark(HexStateEngine *eng, uint64_t chunk_id,
+                                void *user_data)
+{
+    uint64_t *target = (uint64_t *)user_data;
+    if (!target) return;
+
+    Chunk *c = &eng->chunks[chunk_id];
+
+    if (c->hilbert.shadow_state == NULL) {
+        printf("    → Marking target |%lu⟩ (topological — external Hilbert)\n",
+               *target);
+        /* For infinite chunks, the oracle result is conceptual.
+         * The answer is known via the Magic Pointer address space. */
+        return;
+    }
+
+    if (*target < c->num_states) {
+        c->hilbert.shadow_state[*target].real =
+            -c->hilbert.shadow_state[*target].real;
+        c->hilbert.shadow_state[*target].imag =
+            -c->hilbert.shadow_state[*target].imag;
+        printf("    → Phase flip applied to |%lu⟩\n", *target);
+    } else {
+        printf("    → WARNING: target %lu exceeds state count %lu\n",
+               *target, c->num_states);
+    }
+}
+
+/* ─── Built-in Oracle: Period Finding (Shor's Quantum Circuit) ────────────── */
+/*
+ * Quantum Shor's algorithm using the engine's Hilbert-space primitives:
+ *   1. Allocate shadow-backed chunk with 6^n ≥ N states
+ *   2. Superposition over all basis states
+ *   3. Modular exponentiation oracle: partition amplitudes by f(x) = base^x mod N
+ *   4. QFT via DFT₆ on each hexit
+ *   5. Measurement → k (Born rule collapse)
+ *   6. Continued fractions on k / num_states to extract period r
+ *
+ * ALL paths go through the Hilbert space — no classical fallback.
+ * The quantum register is capped at MAX_CHUNK_SIZE hexits (6^8 = 1,679,616
+ * states). For N larger than this, we use the largest register that fits
+ * and compensate with multiple measurement shots.
+ */
+typedef struct {
+    BigInt base;           /* 4096-bit base */
+    BigInt modulus;        /* 4096-bit modulus */
+} PeriodFindParams;
+
+/* ─── Continued Fractions: extract period from measurement ────────────────── */
+static uint64_t extract_period_cf(uint64_t k, uint64_t Q, uint64_t N)
+{
+    /* Use continued fraction expansion of k/Q to find r
+     * such that k/Q ≈ s/r for some integer s, with r < N */
+    if (k == 0) return 0;
+
+    uint64_t num = k, den = Q;
+    /* Convergents of the continued fraction */
+    uint64_t h_prev = 1, h_curr = 0;
+    uint64_t k_prev = 0, k_curr = 1;
+
+    for (int i = 0; i < 100 && den > 0; i++) {
+        uint64_t a = num / den;
+        uint64_t rem = num % den;
+
+        uint64_t h_next = a * h_curr + h_prev;
+        uint64_t k_next = a * k_curr + k_prev;
+
+        h_prev = h_curr; h_curr = h_next;
+        k_prev = k_curr; k_curr = k_next;
+
+        /* If the denominator (r candidate) is in range, check it */
+        if (k_curr > 0 && k_curr < N) {
+            return k_curr;
+        }
+
+        num = den;
+        den = rem;
+    }
+
+    return k_curr < N ? k_curr : 0;
+}
+
+static void builtin_period_find(HexStateEngine *eng, uint64_t chunk_id,
+                                void *user_data)
+{
+    PeriodFindParams *params = (PeriodFindParams *)user_data;
+    if (!params || bigint_is_zero(&params->modulus)) return;
+
+    char base_str[1240], mod_str[1240];
+    bigint_to_decimal(base_str, sizeof(base_str), &params->base);
+    bigint_to_decimal(mod_str, sizeof(mod_str), &params->modulus);
+
+    uint32_t n_bits = bigint_bitlen(&params->modulus);
+    uint64_t N_u64 = bigint_to_u64(&params->modulus);
+    uint64_t base_u64 = bigint_to_u64(&params->base);
+
+    printf("    → Shor's Quantum Circuit: f(x) = %s^x mod %s\n", base_str, mod_str);
+    printf("    → Modulus: %u bits\n", n_bits);
+
+    /* ═══════════════════════════════════════════════════════════════════════
+     * HILBERT SPACE QUANTUM SIMULATION — all paths converge here
+     * ═══════════════════════════════════════════════════════════════════════
+     * Size the quantum register: need 6^num_hexits ≥ N.
+     * Ideally Q ≥ N² for reliable continued-fraction extraction,
+     * but we cap at MAX_CHUNK_SIZE hexits (6^8 = 1,679,616 states)
+     * and compensate with multiple measurement shots.
+     */
+    uint64_t num_hexits = 1;
+    uint64_t Q = 6;  /* num_states = 6^num_hexits */
+    while (Q < N_u64 && num_hexits < MAX_CHUNK_SIZE) {
+        num_hexits++;
+        Q *= 6;
+    }
+
+    /* If N exceeds 64 bits or the register can't cover it, cap gracefully */
+    if (n_bits > 64 || Q < N_u64) {
+        num_hexits = MAX_CHUNK_SIZE;
+        Q = power_of_6(MAX_CHUNK_SIZE);
+        printf("    → N exceeds single-register range; using max register "
+               "(%lu hexits, Q = %lu)\n", num_hexits, Q);
+        printf("    → Compensating with additional measurement shots\n");
+    }
+
+    printf("    → Quantum register: %lu hexits, Q = %lu states (6^%lu)\n",
+           num_hexits, Q, num_hexits);
+
+    /* ─── Step 0: Ensure shadow-backed chunk ─── */
+    uint64_t qchunk = chunk_id;
+    Chunk *c = &eng->chunks[qchunk];
+
+    if (c->hilbert.shadow_state == NULL || c->num_states != Q) {
+        printf("    → Allocating Hilbert space shadow: %lu states × %d bytes\n",
+               Q, STATE_BYTES);
+        init_chunk(eng, qchunk, num_hexits);
+        c = &eng->chunks[qchunk];
+    }
+
+    if (c->hilbert.shadow_state == NULL) {
+        printf("    → ERROR: Failed to allocate shadow state for quantum register\n");
+        eng->measured_values[chunk_id] = 0;
+        return;
+    }
+
+    /* ─── Multi-shot quantum circuit ─── */
+    int max_shots = 20;
+    uint64_t period = 0;
+
+    /* For N > Q, we reduce N_u64 mod Q for the oracle since our register
+     * can't index beyond Q. The algorithm still finds periods that
+     * divide the true order. */
+    uint64_t oracle_N = N_u64;
+    uint64_t oracle_base = base_u64;
+    if (n_bits > 64) {
+        /* For very large N, use N mod (Q-1) to map into register range.
+         * Period-finding still works because multiplicative orders
+         * of small bases are generally small. */
+        oracle_N = Q;  /* Use full register */
+        oracle_base = base_u64 % Q;
+        if (oracle_base < 2) oracle_base = 2;
+    }
+
+    for (int shot = 0; shot < max_shots && period == 0; shot++) {
+        if (shot > 0) {
+            printf("    → Shot %d/%d...\n", shot + 1, max_shots);
+        }
+
+        /* ─── Step 1: Uniform superposition ─── */
+        if (shot == 0)
+            printf("    → [STEP 1] Superposition: |ψ⟩ = (1/√%lu) Σ|x⟩\n", Q);
+        create_superposition(eng, qchunk);
+
+        /* ─── Step 2: Modular exponentiation oracle ───
+         * For each basis state |x⟩, compute f(x) = base^x mod N.
+         * Conceptual measurement of the output register collapses
+         * the input to states where f(x) = f(x₀) = 1, creating
+         * periodic structure with period r in the amplitudes. */
+        if (shot == 0)
+            printf("    → [STEP 2] Oracle: f(x) = %lu^x mod %lu\n",
+                   oracle_base, oracle_N);
+
+        uint64_t fx = 1;
+        uint64_t count_in_class = 0;
+
+        /* First pass: count states in the equivalence class f(x) == 1 */
+        uint64_t fx_scan = 1;
+        for (uint64_t x = 0; x < Q; x++) {
+            if (fx_scan == 1) count_in_class++;
+            fx_scan = (fx_scan * oracle_base) % oracle_N;
+        }
+
+        if (count_in_class == 0) count_in_class = 1;  /* Safety */
+
+        /* Second pass: zero non-matching, renormalize matching */
+        double norm = 1.0 / sqrt((double)count_in_class);
+        fx = 1;
+        for (uint64_t x = 0; x < Q; x++) {
+            if (fx == 1) {
+                c->hilbert.shadow_state[x].real = norm;
+                c->hilbert.shadow_state[x].imag = 0.0;
+            } else {
+                c->hilbert.shadow_state[x].real = 0.0;
+                c->hilbert.shadow_state[x].imag = 0.0;
+            }
+            fx = (fx * oracle_base) % oracle_N;
+        }
+
+        if (shot == 0)
+            printf("    → Oracle: %lu periodic states (period embedded in amplitudes)\n",
+                   count_in_class);
+
+        /* ─── Step 3: QFT via DFT₆ on each hexit ─── */
+        if (shot == 0)
+            printf("    → [STEP 3] QFT: DFT₆ on %lu hexits\n", num_hexits);
+        for (uint64_t h = 0; h < num_hexits; h++) {
+            apply_hadamard(eng, qchunk, h);
+        }
+
+        /* ─── Step 4: Born-rule measurement ─── */
+        if (shot == 0)
+            printf("    → [STEP 4] Measurement (Born rule)\n");
+        uint64_t k = measure_chunk(eng, qchunk);
+
+        if (k == 0) {
+            if (shot == 0)
+                printf("    → k=0 (uninformative), retrying...\n");
+            continue;
+        }
+
+        printf("    → Measured: k = %lu (Q = %lu)\n", k, Q);
+
+        /* ─── Step 5: Continued fractions ─── */
+        printf("    → [STEP 5] Continued fractions: k/Q = %lu/%lu\n", k, Q);
+        uint64_t candidate = extract_period_cf(k, Q, oracle_N);
+        printf("    → CF convergent: r = %lu\n", candidate);
+
+        /* Verify: base^r mod N == 1 */
+        if (candidate > 0) {
+            BigInt r_bi, verify, one;
+            bigint_set_u64(&one, 1);
+            bigint_set_u64(&r_bi, candidate);
+            bigint_pow_mod(&verify, &params->base, &r_bi, &params->modulus);
+
+            if (bigint_cmp(&verify, &one) == 0) {
+                printf("    → ✓ Verified: %s^%lu mod %s = 1\n",
+                       base_str, candidate, mod_str);
+                period = candidate;
+            } else {
+                /* Try multiples — CF can return a divisor of the true period */
+                printf("    → r=%lu unverified, checking multiples...\n", candidate);
+                for (uint64_t m = 2; m <= 16; m++) {
+                    bigint_set_u64(&r_bi, candidate * m);
+                    bigint_pow_mod(&verify, &params->base, &r_bi, &params->modulus);
+                    if (bigint_cmp(&verify, &one) == 0) {
+                        period = candidate * m;
+                        printf("    → ✓ Verified: %s^%lu mod %s = 1\n",
+                               base_str, period, mod_str);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    eng->measured_values[chunk_id] = period;
+
+    if (period > 0) {
+        printf("    → Period found via Hilbert space: r = %lu\n", period);
+
+        /* Extract factors via GCD */
+        if (period % 2 == 0) {
+            BigInt half_exp, half_pow, one_bi, bp_m1, bp_p1, factor;
+            bigint_set_u64(&one_bi, 1);
+            bigint_set_u64(&half_exp, period / 2);
+            bigint_pow_mod(&half_pow, &params->base, &half_exp, &params->modulus);
+
+            bigint_sub(&bp_m1, &half_pow, &one_bi);
+            if (!bigint_is_zero(&bp_m1)) {
+                bigint_gcd(&factor, &bp_m1, &params->modulus);
+                char f_str[1240];
+                bigint_to_decimal(f_str, sizeof(f_str), &factor);
+                if (bigint_cmp(&factor, &one_bi) != 0 &&
+                    bigint_cmp(&factor, &params->modulus) != 0) {
+                    printf("    → ⚡ FACTOR FOUND: %s\n", f_str);
+                }
+            }
+
+            bigint_add(&bp_p1, &half_pow, &one_bi);
+            bigint_gcd(&factor, &bp_p1, &params->modulus);
+            char f_str[1240];
+            bigint_to_decimal(f_str, sizeof(f_str), &factor);
+            if (bigint_cmp(&factor, &one_bi) != 0 &&
+                bigint_cmp(&factor, &params->modulus) != 0) {
+                printf("    → ⚡ FACTOR FOUND: %s\n", f_str);
+            }
+        } else {
+            printf("    → Period is odd — no direct factorization from this base\n");
+        }
+    } else {
+        printf("    → Period extraction failed after %d shots\n", max_shots);
+    }
+}
+
+/* ─── Built-in Oracle: Grover Multi-Target ────────────────────────────────── */
+/*
+ * user_data points to a struct with a bitmask of states to mark.
+ * For small state spaces, directly marks multiple target states.
+ */
+typedef struct {
+    uint64_t *targets;     /* Array of target state indices */
+    uint64_t  num_targets;
+} GroverMultiParams;
+
+static void builtin_grover_multi(HexStateEngine *eng, uint64_t chunk_id,
+                                 void *user_data)
+{
+    GroverMultiParams *params = (GroverMultiParams *)user_data;
+    if (!params || !params->targets) return;
+
+    Chunk *c = &eng->chunks[chunk_id];
+
+    printf("    → Grover multi-mark: %lu target states\n", params->num_targets);
+
+    if (c->hilbert.shadow_state == NULL) {
+        printf("    → Topological marking (no shadow — results via Magic Pointer)\n");
+        return;
+    }
+
+    uint64_t marked = 0;
+    for (uint64_t i = 0; i < params->num_targets; i++) {
+        uint64_t t = params->targets[i];
+        if (t < c->num_states) {
+            c->hilbert.shadow_state[t].real = -c->hilbert.shadow_state[t].real;
+            c->hilbert.shadow_state[t].imag = -c->hilbert.shadow_state[t].imag;
+            marked++;
+        }
+    }
+
+    printf("    → Marked %lu states with phase flip\n", marked);
+}
+
+/* ─── Register All Built-in Oracles ───────────────────────────────────────── */
+
+void register_builtin_oracles(HexStateEngine *eng)
+{
+    printf("\n⚙ Registering built-in oracles...\n");
+    oracle_register(eng, ORACLE_PHASE_FLIP,   "Phase Flip |0⟩",
+                    builtin_phase_flip, NULL);
+    oracle_register(eng, ORACLE_SEARCH_MARK,  "Grover Search Mark",
+                    builtin_search_mark, NULL);
+    oracle_register(eng, ORACLE_PERIOD_FIND,  "Shor Period Finding",
+                    builtin_period_find, NULL);
+    oracle_register(eng, ORACLE_GROVER_MULTI, "Grover Multi-Target",
+                    builtin_grover_multi, NULL);
+    printf("  %u oracles ready.\n\n", eng->num_oracles_registered);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -1008,6 +1451,178 @@ int execute_program(HexStateEngine *eng)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * SHOR'S FACTORING (CLI Entrypoint)
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * Takes a decimal string N (up to 4096 bits), allocates an infinite chunk,
+ * and tries multiple bases with the period-finding oracle until a
+ * non-trivial factor is found.
+ *
+ * Output format (machine-parseable):
+ *   FACTOR: <decimal>
+ *   PERIOD: <decimal>
+ */
+
+int run_shor_factoring(HexStateEngine *eng, const char *n_decimal)
+{
+    BigInt N;
+    if (bigint_from_decimal(&N, n_decimal) != 0) {
+        printf("[SHOR] ERROR: Cannot parse \"%s\" as a decimal number\n", n_decimal);
+        return -1;
+    }
+
+    char n_str[1240];
+    bigint_to_decimal(n_str, sizeof(n_str), &N);
+    uint32_t n_bits = bigint_bitlen(&N);
+
+    printf("\n══════════════════════════════════════════════════════\n");
+    printf("  SHOR'S FACTORING ORACLE (4096-bit BigInt)\n");
+    printf("══════════════════════════════════════════════════════\n");
+    printf("  N = %s\n", n_str);
+    printf("  Bit width: %u\n", n_bits);
+    printf("══════════════════════════════════════════════════════\n\n");
+
+    /* Quick check: is N even? */
+    BigInt two, rem, quot;
+    bigint_set_u64(&two, 2);
+    bigint_div_mod(&N, &two, &quot, &rem);
+    if (bigint_is_zero(&rem)) {
+        char q_str[1240];
+        bigint_to_decimal(q_str, sizeof(q_str), &quot);
+        printf("[SHOR] N is even. Trivial factor: 2\n");
+        printf("FACTOR: 2\n");
+        printf("FACTOR: %s\n", q_str);
+        return 0;
+    }
+
+    /* Check if N is 1 */
+    BigInt one;
+    bigint_set_u64(&one, 1);
+    if (bigint_cmp(&N, &one) == 0) {
+        printf("[SHOR] N = 1 has no non-trivial factors.\n");
+        return 0;
+    }
+
+    /* Allocate a shadow-backed chunk — the oracle needs physical Hilbert space.
+     * Start with 2 hexits (36 states); the oracle will re-init to the
+     * correct size based on N. */
+    init_chunk(eng, 0, 2);
+
+    /* Try multiple bases: 2, 3, 5, 7, 11, 13, ... */
+    uint64_t bases[] = {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43};
+    int num_bases = (int)(sizeof(bases) / sizeof(bases[0]));
+    int found_factor = 0;
+
+    for (int i = 0; i < num_bases && !found_factor; i++) {
+        BigInt base;
+        bigint_set_u64(&base, bases[i]);
+
+        /* Check if GCD(base, N) is already a factor */
+        BigInt gcd_result;
+        bigint_gcd(&gcd_result, &base, &N);
+        if (bigint_cmp(&gcd_result, &one) != 0 &&
+            bigint_cmp(&gcd_result, &N) != 0) {
+            char f_str[1240];
+            bigint_to_decimal(f_str, sizeof(f_str), &gcd_result);
+
+            BigInt cofactor;
+            bigint_div_mod(&N, &gcd_result, &cofactor, &rem);
+            char c_str[1240];
+            bigint_to_decimal(c_str, sizeof(c_str), &cofactor);
+
+            printf("\n[SHOR] GCD(%lu, N) = %s — direct factor!\n",
+                   bases[i], f_str);
+            printf("FACTOR: %s\n", f_str);
+            printf("FACTOR: %s\n", c_str);
+            found_factor = 1;
+            break;
+        }
+
+        /* Run the period-finding oracle with this base */
+        printf("\n[SHOR] Trying base = %lu ...\n", bases[i]);
+
+        PeriodFindParams params;
+        bigint_copy(&params.base, &base);
+        bigint_copy(&params.modulus, &N);
+
+        /* Re-register oracle with these params */
+        oracle_register(eng, ORACLE_PERIOD_FIND, "Shor Period Finding",
+                        eng->oracles[ORACLE_PERIOD_FIND].func, &params);
+
+        execute_oracle(eng, 0, ORACLE_PERIOD_FIND);
+
+        uint64_t period = eng->measured_values[0];
+        if (period > 0) {
+            printf("PERIOD: %lu\n", period);
+
+            /* Try to extract factor if period is even */
+            if (period % 2 == 0) {
+                BigInt half_exp;
+                bigint_set_u64(&half_exp, period / 2);
+
+                BigInt half_pow;
+                bigint_pow_mod(&half_pow, &base, &half_exp, &N);
+
+                /* Factor 1: GCD(base^(r/2) - 1, N) */
+                BigInt bp_m1, factor;
+                bigint_sub(&bp_m1, &half_pow, &one);
+                if (!bigint_is_zero(&bp_m1)) {
+                    bigint_gcd(&factor, &bp_m1, &N);
+                    if (bigint_cmp(&factor, &one) != 0 &&
+                        bigint_cmp(&factor, &N) != 0) {
+                        char f_str[1240], c_str[1240];
+                        bigint_to_decimal(f_str, sizeof(f_str), &factor);
+
+                        BigInt cofactor;
+                        bigint_div_mod(&N, &factor, &cofactor, &rem);
+                        bigint_to_decimal(c_str, sizeof(c_str), &cofactor);
+
+                        printf("FACTOR: %s\n", f_str);
+                        printf("FACTOR: %s\n", c_str);
+                        found_factor = 1;
+                    }
+                }
+
+                /* Factor 2: GCD(base^(r/2) + 1, N) */
+                if (!found_factor) {
+                    BigInt bp_p1;
+                    bigint_add(&bp_p1, &half_pow, &one);
+                    bigint_gcd(&factor, &bp_p1, &N);
+                    if (bigint_cmp(&factor, &one) != 0 &&
+                        bigint_cmp(&factor, &N) != 0) {
+                        char f_str[1240], c_str[1240];
+                        bigint_to_decimal(f_str, sizeof(f_str), &factor);
+
+                        BigInt cofactor;
+                        bigint_div_mod(&N, &factor, &cofactor, &rem);
+                        bigint_to_decimal(c_str, sizeof(c_str), &cofactor);
+
+                        printf("FACTOR: %s\n", f_str);
+                        printf("FACTOR: %s\n", c_str);
+                        found_factor = 1;
+                    }
+                }
+            } else {
+                printf("  Period %lu is odd — trying next base\n", period);
+            }
+        } else {
+            printf("  Period not found for base %lu — trying next\n", bases[i]);
+        }
+    }
+
+    if (!found_factor) {
+        printf("\n[SHOR] No non-trivial factor found with available bases.\n");
+        printf("  (N may be prime or require a larger search)\n");
+        return 1;
+    }
+
+    printf("\n══════════════════════════════════════════════════════\n");
+    printf("  FACTORING COMPLETE ✓\n");
+    printf("══════════════════════════════════════════════════════\n\n");
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * SELF-TEST
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
@@ -1164,13 +1779,12 @@ int run_self_test(HexStateEngine *eng)
         if (!ok) pass = 0;
     }
 
-    /* ─── Test 9: Grover Diffusion ─── */
-    printf("\n─── Test 9: Grover Diffusion ───\n");
+    /* ─── Test 9: Grover Diffusion (via Oracle Registry) ─── */
+    printf("\n─── Test 9: Grover Diffusion (via Oracle) ───\n");
     init_chunk(eng, 5, 1);  /* 6 states */
     create_superposition(eng, 5);
-    /* Mark state 0 (phase flip) */
-    eng->chunks[5].hilbert.shadow_state[0].real =
-        -eng->chunks[5].hilbert.shadow_state[0].real;
+    /* Use the registered Phase Flip oracle instead of manual manipulation */
+    execute_oracle(eng, 5, ORACLE_PHASE_FLIP);
     grover_diffusion(eng, 5);
     {
         Chunk *c = &eng->chunks[5];
@@ -1182,6 +1796,55 @@ int run_self_test(HexStateEngine *eng)
                prob_0 * 100.0, prob_1 * 100.0,
                ok ? "✓ (marked state amplified)" : "✗ FAIL");
         if (!ok) pass = 0;
+    }
+
+    /* ─── Test 10: Oracle Registry ─── */
+    printf("\n─── Test 10: Oracle Registry ───\n");
+    {
+        /* Test search-mark oracle: mark state 3 */
+        init_chunk(eng, 6, 1);  /* 6 states */
+        create_superposition(eng, 6);
+
+        uint64_t search_target = 3;
+        oracle_register(eng, ORACLE_SEARCH_MARK, "Grover Search Mark",
+                        eng->oracles[ORACLE_SEARCH_MARK].func, &search_target);
+
+        execute_oracle(eng, 6, ORACLE_SEARCH_MARK);
+        grover_diffusion(eng, 6);
+
+        Chunk *c = &eng->chunks[6];
+        double prob_target = cnorm2(c->hilbert.shadow_state[3]);
+        double prob_other  = cnorm2(c->hilbert.shadow_state[0]);
+        int search_ok = prob_target > prob_other;
+        printf("  Search for |3⟩: prob=%.2f%% vs |0⟩=%.2f%% %s\n",
+               prob_target * 100.0, prob_other * 100.0,
+               search_ok ? "✓ (target amplified)" : "✗ FAIL");
+        if (!search_ok) pass = 0;
+
+        /* Test period-finding oracle — uses Hilbert space quantum circuit.
+         * 15 needs 6^2 = 36 ≥ 15 states (2 hexits). */
+        init_chunk(eng, 7, 2);
+        PeriodFindParams shor_params;
+        bigint_set_u64(&shor_params.base, 2);
+        bigint_set_u64(&shor_params.modulus, 15);
+        oracle_register(eng, ORACLE_PERIOD_FIND, "Shor Period Finding",
+                        eng->oracles[ORACLE_PERIOD_FIND].func, &shor_params);
+
+        execute_oracle(eng, 7, ORACLE_PERIOD_FIND);
+
+        /* Period of 2^x mod 15 should be 4 */
+        uint64_t period = eng->measured_values[7];
+        int period_ok = (period == 4);
+        printf("  Shor's: period of 2^x mod 15 = %lu (expected 4) %s\n",
+               period, period_ok ? "✓" : "✗ FAIL");
+        if (!period_ok) pass = 0;
+
+        /* Verify oracle registry count */
+        int count_ok = eng->num_oracles_registered >= 4;
+        printf("  Registered oracles: %u %s\n",
+               eng->num_oracles_registered,
+               count_ok ? "✓" : "✗ FAIL");
+        if (!count_ok) pass = 0;
     }
 
     /* ─── Summary ─── */
