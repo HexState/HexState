@@ -390,8 +390,10 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
          */
         uint64_t result = 0;
         int found_partner = 0;
-        uint64_t partner_sum = 0;
         int num_measured_partners = 0;
+
+        /* Count partner parities to determine entangled parity */
+        int parity_even = 0, parity_odd = 0;
 
         for (uint64_t i = 0; i < eng->num_braid_links; i++) {
             BraidLink *l = &eng->braid_links[i];
@@ -411,29 +413,32 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             /* Check if partner has been measured */
             uint64_t partner_val = eng->measured_values[partner_id];
             if (partner_val != 0 || partner->locked) {
-                /* Partner was measured — correlate via braid topology.
-                 * Use XOR mixing of partner value with the braid's
-                 * Magic Pointer pair (acts as basis rotation). */
-                uint64_t braid_phase = eng->chunks[id].hilbert.magic_ptr
-                                     ^ partner->hilbert.magic_ptr;
-                partner_sum += partner_val ^ (braid_phase & 0xFFFF);
+                if (partner_val % 2 == 0) parity_even++;
+                else parity_odd++;
                 num_measured_partners++;
                 found_partner = 1;
             }
         }
 
+        /* Generate a random value, then enforce parity correlation */
+        uint64_t modulus = c->num_states < 1000000 ? c->num_states : 1000000;
+        result = engine_prng(eng) % modulus;
+
         if (found_partner && num_measured_partners > 0) {
-            /* Derive result from measured partners — entanglement correlation */
-            uint64_t mixed = partner_sum / num_measured_partners;
-            /* Add small quantum noise (not perfectly deterministic) */
-            mixed ^= engine_prng(eng) & 0x3;  /* 2-bit noise */
-            result = mixed % (c->num_states < 1000000 ? c->num_states : 1000000);
+            /* Determine the majority parity of measured partners */
+            int target_parity = (parity_odd > parity_even) ? 1 : 0;
+
+            /* If our result doesn't match, flip to the nearest
+             * value with correct parity — this preserves
+             * entanglement parity correlations while keeping
+             * the magnitude random (like real quantum entanglement) */
+            if ((result % 2) != (uint64_t)target_parity) {
+                result = result > 0 ? result - 1 : result + 1;
+            }
             printf("  [MEAS] Entangled topological measurement on chunk %lu => %lu "
-                   "(from %d braided partners)\n", id, result, num_measured_partners);
+                   "(parity=%d, from %d braided partners)\n",
+                   id, result, target_parity, num_measured_partners);
         } else {
-            /* No measured partners — generate fresh randomness */
-            result = engine_prng(eng) % (c->num_states < 1000000
-                              ? c->num_states : 1000000);
             printf("  [MEAS] Topological measurement on chunk %lu => %lu\n", id, result);
         }
 
