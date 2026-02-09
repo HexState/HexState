@@ -96,7 +96,8 @@ typedef struct {
     uint64_t  q_entangle_seed;    /* Legacy seed (fallback) */
     uint64_t  q_basis_rotation;   /* Legacy basis rotation (fallback) */
     /* ─── Joint quantum state (genuine Hilbert space) ─── */
-    Complex  *q_joint_state;      /* Shared 2-particle state: 36 amplitudes (d=6) */
+    Complex  *q_joint_state;      /* Shared 2-particle state: dim² amplitudes */
+    uint32_t  q_joint_dim;        /* Dimension of joint state (default 6) */
     uint64_t  q_partner;          /* Partner chunk ID in entangled pair */
     uint8_t   q_which;            /* 0 = A side, 1 = B side of joint state */
 } HilbertRef;
@@ -222,6 +223,8 @@ void grover_diffusion(HexStateEngine *eng, uint64_t id);
 /* Entanglement */
 void braid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b,
                   uint64_t hexit_a, uint64_t hexit_b);
+void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
+                      uint64_t hexit_a, uint64_t hexit_b, uint32_t dim);
 void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b);
 
 /* Multiverse operations */
