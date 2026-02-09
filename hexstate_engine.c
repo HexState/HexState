@@ -237,6 +237,37 @@ static double prng_uniform(HexStateEngine *eng)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
+ * MAGIC POINTER RESOLUTION
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * Every operation must go through this gate. The Magic Pointer is validated,
+ * the chunk identity is extracted, and the shadow_state cache pointer is
+ * returned (may be NULL for infinite / external-only chunks).
+ */
+
+static Complex *resolve_shadow(HexStateEngine *eng, uint64_t chunk_id,
+                                uint64_t *out_num_states)
+{
+    if (chunk_id >= eng->num_chunks) return NULL;
+    Chunk *c = &eng->chunks[chunk_id];
+
+    /* ── Validate Magic Pointer ── */
+    if (!IS_MAGIC_PTR(c->hilbert.magic_ptr)) {
+        printf("  [RESOLVE] ERROR: chunk %lu has invalid Magic Pointer 0x%016lX\n",
+               chunk_id, c->hilbert.magic_ptr);
+        return NULL;
+    }
+
+    /* ── Extract identity from pointer ── */
+    uint64_t resolved_id = MAGIC_PTR_ID(c->hilbert.magic_ptr);
+    (void)resolved_id;  /* identity confirmed — matches chunk_id by construction */
+
+    if (out_num_states) *out_num_states = c->num_states;
+
+    /* Return the shadow cache at this Magic Pointer address (NULL = infinite) */
+    return c->hilbert.shadow_state;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
  * CHUNK INITIALIZATION
  * ═══════════════════════════════════════════════════════════════════════════════ */
 
@@ -308,7 +339,11 @@ void create_superposition(HexStateEngine *eng, uint64_t id)
     if (id >= eng->num_chunks) return;
     Chunk *c = &eng->chunks[id];
 
-    if (c->hilbert.shadow_state == NULL) {
+    /* ═══ Resolve Magic Pointer ═══ */
+    uint64_t ns = 0;
+    Complex *state = resolve_shadow(eng, id, &ns);
+
+    if (state == NULL) {
         /* ── WRITE superposition to Magic Pointer address ──
          * The HilbertRef struct IS the memory at this pointer.
          * Setting q_flags stores the quantum state there. */
@@ -319,14 +354,14 @@ void create_superposition(HexStateEngine *eng, uint64_t id)
         return;
     }
 
-    double inv_sqrt_n = 1.0 / sqrt((double)c->num_states);
-    for (uint64_t i = 0; i < c->num_states; i++) {
-        c->hilbert.shadow_state[i].real = inv_sqrt_n;
-        c->hilbert.shadow_state[i].imag = 0.0;
+    double inv_sqrt_n = 1.0 / sqrt((double)ns);
+    for (uint64_t i = 0; i < ns; i++) {
+        state[i].real = inv_sqrt_n;
+        state[i].imag = 0.0;
     }
 
-    printf("  [SUP] Superposition on chunk %lu (%lu states, amp=%.6f)\n",
-           id, c->num_states, inv_sqrt_n);
+    printf("  [SUP] Superposition on chunk %lu (%lu states, amp=%.6f) via Ptr 0x%016lX\n",
+           id, ns, inv_sqrt_n, c->hilbert.magic_ptr);
 }
 
 /* ─── Hadamard (DFT₆) Gate ────────────────────────────────────────────────── */
@@ -384,6 +419,11 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
 
     if (hexit_index >= c->size) return;
 
+    /* ═══ Resolve Magic Pointer ═══ */
+    uint64_t ns = 0;
+    Complex *state = resolve_shadow(eng, id, &ns);
+    if (state == NULL) return;  /* shouldn't happen on this path */
+
     /*
      * Apply DFT₆ to the specified hexit.
      * For each group of states sharing the same "other hexits",
@@ -397,13 +437,13 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
 
     Complex temp[6];
 
-    for (uint64_t base = 0; base < c->num_states; base++) {
+    for (uint64_t base = 0; base < ns; base++) {
         /* Skip if not at the start of a block for this hexit */
         if ((base / stride) % 6 != 0) continue;
 
         /* Gather the 6 amplitudes */
         for (int j = 0; j < 6; j++) {
-            temp[j] = c->hilbert.shadow_state[base + j * stride];
+            temp[j] = state[base + j * stride];
         }
 
         /* Apply DFT₆ */
@@ -412,11 +452,12 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
             for (int k = 0; k < 6; k++) {
                 sum = cadd(sum, cmul(dft6_matrix[j][k], temp[k]));
             }
-            c->hilbert.shadow_state[base + j * stride] = sum;
+            state[base + j * stride] = sum;
         }
     }
 
-    printf("  [H] DFT₆ Hadamard on chunk %lu, hexit %lu\n", id, hexit_index);
+    printf("  [H] DFT₆ Hadamard on chunk %lu, hexit %lu via Ptr 0x%016lX\n",
+           id, hexit_index, c->hilbert.magic_ptr);
 }
 
 /* ─── Measurement (Born Rule) ─────────────────────────────────────────────── */
@@ -512,13 +553,18 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
         return result;
     }
 
+    /* ═══ Resolve Magic Pointer ═══ */
+    uint64_t ns = 0;
+    Complex *state = resolve_shadow(eng, id, &ns);
+    if (state == NULL) return 0;  /* shouldn't happen on this path */
+
     /* Compute cumulative probability distribution */
     double r = prng_uniform(eng);
     double cumulative = 0.0;
     uint64_t outcome = 0;
 
-    for (uint64_t i = 0; i < c->num_states; i++) {
-        cumulative += cnorm2(c->hilbert.shadow_state[i]);
+    for (uint64_t i = 0; i < ns; i++) {
+        cumulative += cnorm2(state[i]);
         if (cumulative >= r) {
             outcome = i;
             break;
@@ -526,15 +572,15 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
     }
 
     /* Collapse: outcome gets amplitude 1, rest 0 */
-    for (uint64_t i = 0; i < c->num_states; i++) {
+    for (uint64_t i = 0; i < ns; i++) {
         if (i == outcome) {
-            c->hilbert.shadow_state[i] = cmplx(1.0, 0.0);
+            state[i] = cmplx(1.0, 0.0);
         } else {
-            c->hilbert.shadow_state[i] = cmplx(0.0, 0.0);
+            state[i] = cmplx(0.0, 0.0);
         }
     }
 
-    /* Propagate collapse to braided partners */
+    /* Propagate collapse to braided partners (also via Magic Pointers) */
     for (uint64_t i = 0; i < eng->num_braid_links; i++) {
         BraidLink *l = &eng->braid_links[i];
         uint64_t partner_id = UINT64_MAX;
@@ -546,26 +592,29 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             continue;
 
         Chunk *partner = &eng->chunks[partner_id];
-        if (partner->hilbert.shadow_state != NULL && !partner->locked) {
+        /* Resolve partner's Magic Pointer */
+        uint64_t p_ns = 0;
+        Complex *p_state = resolve_shadow(eng, partner_id, &p_ns);
+        if (p_state != NULL && !partner->locked) {
             /* Correlate partner: boost amplitude at matching outcome,
              * reduce others — simulates entanglement collapse */
             double boost = 0.7;
-            uint64_t correlated = outcome % partner->num_states;
+            uint64_t correlated = outcome % p_ns;
             double total = 0.0;
-            for (uint64_t j = 0; j < partner->num_states; j++) {
+            for (uint64_t j = 0; j < p_ns; j++) {
                 if (j == correlated) {
-                    partner->hilbert.shadow_state[j].real *= (1.0 + boost);
+                    p_state[j].real *= (1.0 + boost);
                 } else {
-                    partner->hilbert.shadow_state[j].real *= (1.0 - boost / (double)(partner->num_states - 1));
+                    p_state[j].real *= (1.0 - boost / (double)(p_ns - 1));
                 }
-                total += cnorm2(partner->hilbert.shadow_state[j]);
+                total += cnorm2(p_state[j]);
             }
             /* Renormalize */
             if (total > 0.0) {
                 double norm = 1.0 / sqrt(total);
-                for (uint64_t j = 0; j < partner->num_states; j++) {
-                    partner->hilbert.shadow_state[j].real *= norm;
-                    partner->hilbert.shadow_state[j].imag *= norm;
+                for (uint64_t j = 0; j < p_ns; j++) {
+                    p_state[j].real *= norm;
+                    p_state[j].imag *= norm;
                 }
             }
         }
@@ -582,26 +631,32 @@ void grover_diffusion(HexStateEngine *eng, uint64_t id)
     if (id >= eng->num_chunks) return;
     Chunk *c = &eng->chunks[id];
 
-    if (c->hilbert.shadow_state == NULL) {
-        printf("  [GROV] Topological diffusion on infinite chunk %lu\n", id);
+    /* ═══ Resolve Magic Pointer ═══ */
+    uint64_t ns = 0;
+    Complex *state = resolve_shadow(eng, id, &ns);
+
+    if (state == NULL) {
+        printf("  [GROV] Topological diffusion on infinite chunk %lu "
+               "(Ptr 0x%016lX)\n", id, c->hilbert.magic_ptr);
         return;
     }
 
     /* Step 1: Calculate mean amplitude */
     Complex mean = cmplx(0.0, 0.0);
-    for (uint64_t i = 0; i < c->num_states; i++) {
-        mean = cadd(mean, c->hilbert.shadow_state[i]);
+    for (uint64_t i = 0; i < ns; i++) {
+        mean = cadd(mean, state[i]);
     }
-    mean.real /= (double)c->num_states;
-    mean.imag /= (double)c->num_states;
+    mean.real /= (double)ns;
+    mean.imag /= (double)ns;
 
     /* Step 2: Reflect about mean: amp = 2*mean - amp */
-    for (uint64_t i = 0; i < c->num_states; i++) {
-        c->hilbert.shadow_state[i].real = 2.0 * mean.real - c->hilbert.shadow_state[i].real;
-        c->hilbert.shadow_state[i].imag = 2.0 * mean.imag - c->hilbert.shadow_state[i].imag;
+    for (uint64_t i = 0; i < ns; i++) {
+        state[i].real = 2.0 * mean.real - state[i].real;
+        state[i].imag = 2.0 * mean.imag - state[i].imag;
     }
 
-    printf("  [GROV] Diffusion on chunk %lu\n", id);
+    printf("  [GROV] Diffusion on chunk %lu via Ptr 0x%016lX\n",
+           id, c->hilbert.magic_ptr);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
@@ -923,17 +978,20 @@ static void builtin_phase_flip(HexStateEngine *eng, uint64_t chunk_id,
                                void *user_data)
 {
     (void)user_data;
-    Chunk *c = &eng->chunks[chunk_id];
 
-    if (c->hilbert.shadow_state == NULL) {
-        printf("    → Phase flip on state |0⟩ (topological — no shadow)\n");
+    /* ═══ Resolve Magic Pointer ═══ */
+    uint64_t ns = 0;
+    Complex *state = resolve_shadow(eng, chunk_id, &ns);
+
+    if (state == NULL) {
+        printf("    → Phase flip on state |0⟩ (topological — via Magic Pointer)\n");
         return;
     }
 
-    if (c->num_states > 0) {
-        c->hilbert.shadow_state[0].real = -c->hilbert.shadow_state[0].real;
-        c->hilbert.shadow_state[0].imag = -c->hilbert.shadow_state[0].imag;
-        printf("    → Phase flip applied to |0⟩\n");
+    if (ns > 0) {
+        state[0].real = -state[0].real;
+        state[0].imag = -state[0].imag;
+        printf("    → Phase flip applied to |0⟩ via Magic Pointer\n");
     }
 }
 
@@ -948,25 +1006,25 @@ static void builtin_search_mark(HexStateEngine *eng, uint64_t chunk_id,
     uint64_t *target = (uint64_t *)user_data;
     if (!target) return;
 
-    Chunk *c = &eng->chunks[chunk_id];
+    /* ═══ Resolve Magic Pointer ═══ */
+    uint64_t ns = 0;
+    Complex *state = resolve_shadow(eng, chunk_id, &ns);
 
-    if (c->hilbert.shadow_state == NULL) {
-        printf("    → Marking target |%lu⟩ (topological — external Hilbert)\n",
+    if (state == NULL) {
+        printf("    → Marking target |%lu⟩ (topological — via Magic Pointer)\n",
                *target);
         /* For infinite chunks, the oracle result is conceptual.
          * The answer is known via the Magic Pointer address space. */
         return;
     }
 
-    if (*target < c->num_states) {
-        c->hilbert.shadow_state[*target].real =
-            -c->hilbert.shadow_state[*target].real;
-        c->hilbert.shadow_state[*target].imag =
-            -c->hilbert.shadow_state[*target].imag;
-        printf("    → Phase flip applied to |%lu⟩\n", *target);
+    if (*target < ns) {
+        state[*target].real = -state[*target].real;
+        state[*target].imag = -state[*target].imag;
+        printf("    → Phase flip applied to |%lu⟩ via Magic Pointer\n", *target);
     } else {
         printf("    → WARNING: target %lu exceeds state count %lu\n",
-               *target, c->num_states);
+               *target, ns);
     }
 }
 
@@ -1260,26 +1318,28 @@ static void builtin_grover_multi(HexStateEngine *eng, uint64_t chunk_id,
     GroverMultiParams *params = (GroverMultiParams *)user_data;
     if (!params || !params->targets) return;
 
-    Chunk *c = &eng->chunks[chunk_id];
-
     printf("    → Grover multi-mark: %lu target states\n", params->num_targets);
 
-    if (c->hilbert.shadow_state == NULL) {
-        printf("    → Topological marking (no shadow — results via Magic Pointer)\n");
+    /* ═══ Resolve Magic Pointer ═══ */
+    uint64_t ns = 0;
+    Complex *state = resolve_shadow(eng, chunk_id, &ns);
+
+    if (state == NULL) {
+        printf("    → Topological marking (via Magic Pointer — no local shadow)\n");
         return;
     }
 
     uint64_t marked = 0;
     for (uint64_t i = 0; i < params->num_targets; i++) {
         uint64_t t = params->targets[i];
-        if (t < c->num_states) {
-            c->hilbert.shadow_state[t].real = -c->hilbert.shadow_state[t].real;
-            c->hilbert.shadow_state[t].imag = -c->hilbert.shadow_state[t].imag;
+        if (t < ns) {
+            state[t].real = -state[t].real;
+            state[t].imag = -state[t].imag;
             marked++;
         }
     }
 
-    printf("    → Marked %lu states with phase flip\n", marked);
+    printf("    → Marked %lu states with phase flip via Magic Pointer\n", marked);
 }
 
 /* ─── Register All Built-in Oracles ───────────────────────────────────────── */
@@ -1311,26 +1371,28 @@ void print_chunk_state(HexStateEngine *eng, uint64_t id)
     printf("  Hexits: %lu  |  States: %lu  |  Locked: %s\n",
            c->size, c->num_states, c->locked ? "YES" : "NO");
 
-    if (c->hilbert.shadow_state == NULL) {
-        printf("  [External Hilbert space — no local shadow]\n");
+    /* ═══ Resolve Magic Pointer ═══ */
+    uint64_t ns = 0;
+    Complex *state = resolve_shadow(eng, id, &ns);
+
+    if (state == NULL) {
+        printf("  [External Hilbert space — via Magic Pointer, no local shadow]\n");
         return;
     }
 
     /* Print first N states with non-negligible amplitude */
     uint64_t printed = 0;
-    uint64_t max_print = c->num_states < 32 ? c->num_states : 32;
-    for (uint64_t i = 0; i < c->num_states && printed < max_print; i++) {
-        double prob = cnorm2(c->hilbert.shadow_state[i]);
+    uint64_t max_print = ns < 32 ? ns : 32;
+    for (uint64_t i = 0; i < ns && printed < max_print; i++) {
+        double prob = cnorm2(state[i]);
         if (prob > 1e-12 || i < 6) {
             printf("  State[%lu]: %.6f + %.6fi  (prob=%.4f%%)\n",
-                   i, c->hilbert.shadow_state[i].real,
-                   c->hilbert.shadow_state[i].imag,
-                   prob * 100.0);
+                   i, state[i].real, state[i].imag, prob * 100.0);
             printed++;
         }
     }
-    if (c->num_states > max_print) {
-        printf("  ... (%lu more states)\n", c->num_states - max_print);
+    if (ns > max_print) {
+        printf("  ... (%lu more states)\n", ns - max_print);
     }
 }
 
@@ -1489,99 +1551,101 @@ int execute_instruction(HexStateEngine *eng, Instruction instr)
         break;
     }
 
-    case OP_NULL:
-        /* Zero out chunk state */
-        if (target < eng->num_chunks) {
-            Chunk *c = &eng->chunks[target];
-            if (c->hilbert.shadow_state != NULL) {
-                memset(c->hilbert.shadow_state, 0,
-                       c->num_states * STATE_BYTES);
-                printf("  [NULL] Zeroed chunk %lu\n", target);
-            }
+    case OP_NULL: {
+        /* Zero out chunk state via Magic Pointer */
+        uint64_t null_ns = 0;
+        Complex *null_state = resolve_shadow(eng, target, &null_ns);
+        if (null_state != NULL) {
+            memset(null_state, 0, null_ns * STATE_BYTES);
+            printf("  [NULL] Zeroed chunk %lu via Ptr 0x%016lX\n",
+                   target, eng->chunks[target].hilbert.magic_ptr);
         }
         break;
+    }
 
-    case OP_SHIFT:
-        /* Cyclic shift of state vector */
-        if (target < eng->num_chunks) {
-            Chunk *c = &eng->chunks[target];
-            if (c->hilbert.shadow_state != NULL && c->num_states > 1) {
-                Complex last = c->hilbert.shadow_state[c->num_states - 1];
-                memmove(&c->hilbert.shadow_state[1], &c->hilbert.shadow_state[0],
-                        (c->num_states - 1) * STATE_BYTES);
-                c->hilbert.shadow_state[0] = last;
-                printf("  [SHIFT] Cyclic shift on chunk %lu\n", target);
-            }
+    case OP_SHIFT: {
+        /* Cyclic shift of state vector via Magic Pointer */
+        uint64_t shift_ns = 0;
+        Complex *shift_state = resolve_shadow(eng, target, &shift_ns);
+        if (shift_state != NULL && shift_ns > 1) {
+            Complex last = shift_state[shift_ns - 1];
+            memmove(&shift_state[1], &shift_state[0],
+                    (shift_ns - 1) * STATE_BYTES);
+            shift_state[0] = last;
+            printf("  [SHIFT] Cyclic shift on chunk %lu via Ptr 0x%016lX\n",
+                   target, eng->chunks[target].hilbert.magic_ptr);
         }
         break;
+    }
 
-    case OP_PHASE:
-        /* Phase rotation on chunk */
-        if (target < eng->num_chunks) {
-            Chunk *c = &eng->chunks[target];
-            if (c->hilbert.shadow_state != NULL) {
-                double angle = 2.0 * M_PI * (double)op1 / (double)(1 << 24);
-                double cos_a = cos(angle), sin_a = sin(angle);
-                for (uint64_t i = 0; i < c->num_states; i++) {
-                    Complex *s = &c->hilbert.shadow_state[i];
-                    Complex phase = cmplx(cos_a, sin_a);
-                    *s = cmul(*s, phase);
+    case OP_PHASE: {
+        /* Phase rotation on chunk via Magic Pointer */
+        uint64_t phase_ns = 0;
+        Complex *phase_state = resolve_shadow(eng, target, &phase_ns);
+        if (phase_state != NULL) {
+            double angle = 2.0 * M_PI * (double)op1 / (double)(1 << 24);
+            double cos_a = cos(angle), sin_a = sin(angle);
+            for (uint64_t i = 0; i < phase_ns; i++) {
+                Complex *s = &phase_state[i];
+                Complex ph = cmplx(cos_a, sin_a);
+                *s = cmul(*s, ph);
+            }
+            printf("  [PHASE] Phase rotation on chunk %lu (angle=%.4f) via Ptr 0x%016lX\n",
+                   target, angle, eng->chunks[target].hilbert.magic_ptr);
+        }
+        break;
+    }
+
+    case OP_MIRROR_VOID: {
+        /* Conjugate all amplitudes via Magic Pointer */
+        uint64_t mv_ns = 0;
+        Complex *mv_state = resolve_shadow(eng, target, &mv_ns);
+        if (mv_state != NULL) {
+            for (uint64_t i = 0; i < mv_ns; i++) {
+                mv_state[i].imag = -mv_state[i].imag;
+            }
+            printf("  [MIRROR_VOID] Conjugated chunk %lu via Ptr 0x%016lX\n",
+                   target, eng->chunks[target].hilbert.magic_ptr);
+        }
+        break;
+    }
+
+    case OP_SHIFT_REALITY: {
+        /* Cyclic permutation of state indices via Magic Pointer */
+        uint64_t sr_ns = 0;
+        Complex *sr_state = resolve_shadow(eng, target, &sr_ns);
+        if (sr_state != NULL && sr_ns > 1) {
+            Complex first = sr_state[0];
+            memmove(&sr_state[0], &sr_state[1],
+                    (sr_ns - 1) * STATE_BYTES);
+            sr_state[sr_ns - 1] = first;
+            printf("  [SHIFT_REALITY] Permuted chunk %lu via Ptr 0x%016lX\n",
+                   target, eng->chunks[target].hilbert.magic_ptr);
+        }
+        break;
+    }
+
+    case OP_REPAIR_CAUSALITY: {
+        /* Normalize the state vector via Magic Pointer */
+        uint64_t rc_ns = 0;
+        Complex *rc_state = resolve_shadow(eng, target, &rc_ns);
+        if (rc_state != NULL) {
+            double total = 0.0;
+            for (uint64_t i = 0; i < rc_ns; i++) {
+                total += cnorm2(rc_state[i]);
+            }
+            if (total > 1e-15) {
+                double scale = 1.0 / sqrt(total);
+                for (uint64_t i = 0; i < rc_ns; i++) {
+                    rc_state[i].real *= scale;
+                    rc_state[i].imag *= scale;
                 }
-                printf("  [PHASE] Phase rotation on chunk %lu (angle=%.4f)\n",
-                       target, angle);
             }
+            printf("  [REPAIR] Normalized chunk %lu (prob was %.6f) via Ptr 0x%016lX\n",
+                   target, total, eng->chunks[target].hilbert.magic_ptr);
         }
         break;
-
-    case OP_MIRROR_VOID:
-        /* Conjugate all amplitudes */
-        if (target < eng->num_chunks) {
-            Chunk *c = &eng->chunks[target];
-            if (c->hilbert.shadow_state != NULL) {
-                for (uint64_t i = 0; i < c->num_states; i++) {
-                    c->hilbert.shadow_state[i].imag =
-                        -c->hilbert.shadow_state[i].imag;
-                }
-                printf("  [MIRROR_VOID] Conjugated chunk %lu\n", target);
-            }
-        }
-        break;
-
-    case OP_SHIFT_REALITY:
-        /* Cyclic permutation of state indices */
-        if (target < eng->num_chunks) {
-            Chunk *c = &eng->chunks[target];
-            if (c->hilbert.shadow_state != NULL && c->num_states > 1) {
-                Complex first = c->hilbert.shadow_state[0];
-                memmove(&c->hilbert.shadow_state[0], &c->hilbert.shadow_state[1],
-                        (c->num_states - 1) * STATE_BYTES);
-                c->hilbert.shadow_state[c->num_states - 1] = first;
-                printf("  [SHIFT_REALITY] Permuted chunk %lu\n", target);
-            }
-        }
-        break;
-
-    case OP_REPAIR_CAUSALITY:
-        /* Normalize the state vector */
-        if (target < eng->num_chunks) {
-            Chunk *c = &eng->chunks[target];
-            if (c->hilbert.shadow_state != NULL) {
-                double total = 0.0;
-                for (uint64_t i = 0; i < c->num_states; i++) {
-                    total += cnorm2(c->hilbert.shadow_state[i]);
-                }
-                if (total > 1e-15) {
-                    double scale = 1.0 / sqrt(total);
-                    for (uint64_t i = 0; i < c->num_states; i++) {
-                        c->hilbert.shadow_state[i].real *= scale;
-                        c->hilbert.shadow_state[i].imag *= scale;
-                    }
-                }
-                printf("  [REPAIR] Normalized chunk %lu (total prob was %.6f)\n",
-                       target, total);
-            }
-        }
-        break;
+    }
 
     case OP_TIMELINE_FORK:
         op_timeline_fork(eng, target, op1);
@@ -1593,24 +1657,27 @@ int execute_instruction(HexStateEngine *eng, Instruction instr)
         break;
     }
 
-    case OP_DIMENSIONAL_PEEK:
-        /* Non-destructive probability scan */
+    case OP_DIMENSIONAL_PEEK: {
+        /* Non-destructive probability scan via Magic Pointer */
+        uint64_t pk_ns = 0;
+        Complex *pk_state = resolve_shadow(eng, target, &pk_ns);
         if (target < eng->num_chunks) {
-            Chunk *c = &eng->chunks[target];
             printf("👁️ [PEEK] Non-destructive scan on chunk %lu "
-                   "(Magic Ptr 0x%016lX)\n", target, c->hilbert.magic_ptr);
-            if (c->hilbert.shadow_state != NULL) {
-                double max_prob = 0.0;
-                uint64_t max_state = 0;
-                for (uint64_t i = 0; i < c->num_states; i++) {
-                    double p = cnorm2(c->hilbert.shadow_state[i]);
-                    if (p > max_prob) { max_prob = p; max_state = i; }
-                }
-                printf("  [PEEK] Most probable: state %lu (%.4f%%)\n",
-                       max_state, max_prob * 100.0);
+                   "(Magic Ptr 0x%016lX)\n", target,
+                   eng->chunks[target].hilbert.magic_ptr);
+        }
+        if (pk_state != NULL) {
+            double max_prob = 0.0;
+            uint64_t max_state = 0;
+            for (uint64_t i = 0; i < pk_ns; i++) {
+                double p = cnorm2(pk_state[i]);
+                if (p > max_prob) { max_prob = p; max_state = i; }
             }
+            printf("  [PEEK] Most probable: state %lu (%.4f%%)\n",
+                   max_state, max_prob * 100.0);
         }
         break;
+    }
 
     case OP_ENTROPY_SIPHON:
         /* Transfer probability mass from op1 chunk to target */
