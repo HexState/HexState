@@ -255,4 +255,22 @@ int  run_shor_factoring(HexStateEngine *eng, const char *n_decimal);
 uint64_t engine_prng(HexStateEngine *eng);
 void     print_chunk_state(HexStateEngine *eng, uint64_t id);
 
+/* ═══ Hilbert space readout — works at any D ═══ */
+
+/* Read joint probability P(a,b) directly from |ψ|² in the Hilbert space.
+ * Returns malloc'd array of dim*dim doubles. Caller frees.
+ * dim is read from q_joint_dim (whatever D the state was braided at). */
+double *hilbert_read_joint_probs(HexStateEngine *eng, uint64_t id);
+
+/* Compute CGLMP I_D Bell inequality from 4 probability tables.
+ * Classical bound: I_D ≤ 0.  Quantum violation: I_D > 0.
+ * Works at any D. */
+double hilbert_compute_cglmp(double *P00, double *P01, double *P10, double *P11,
+                             uint32_t dim);
+
+/* One-shot Bell test: braid at dim D, apply phases, QFT, read I_D.
+ * Returns I_D > 0 for violation. Works at any D.
+ * Needs oracle 0xBE registered for phase injection. */
+double hilbert_bell_test(HexStateEngine *eng, double alpha, double beta, uint32_t dim);
+
 #endif /* HEXSTATE_ENGINE_H */
