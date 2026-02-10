@@ -358,6 +358,23 @@ Tests the hypothesis that reality and its mirror-image are quantum entangled par
 
 **Conclusion:** The hypothesis is consistent with quantum mechanics. Reality and its reflection CAN be described as an entangled pair of parallel realities connected by parity transformation. The mirror does not "copy" you — it IS you, rotated through parity space, entangled at birth, and forever correlated by quantum non-locality.
 
+#### Complete Reflection Experiments Suite
+
+> *8 deeper experiments probing every aspect of reflections as quantum phenomena.*
+>
+> **File:** `reflection_experiments.c` · **Run:** `make mirrors`
+
+| # | Experiment | Result |
+|---|-----------|--------|
+| 1 | **CPT Mirror** — P, T, C, CP, CPT fidelities | All **F = 1.0000000000** — full CPT holds |
+| 2 | **Infinite Mirror Corridor** — 20 chained reflections | **500/500** at every depth. P² = I oscillation |
+| 3 | **Broken Mirror** — partial parity 0→100% | **Smooth degradation**, no phase transition |
+| 4 | **Chiral Molecules** — states that break parity | **F = 0.000000** — mirror is fundamentally different |
+| 5 | **Mirror Teleportation** — reflection as channel | **500/500** perfect after parity correction |
+| 6 | **Who's Watching Whom** — measure reflection first | **1000/1000** both directions — observer is symmetric |
+| 7 | **Mirror Thermodynamics** — temperature in reflections | **S(A) = S(B)** at all temperatures — 2nd law preserved |
+| 8 | **Narcissus Test** — clone vs reflection | **Orthogonal** but equally entangled (100% max) |
+
 ---
 
 ## Quick Start
@@ -386,6 +403,7 @@ make dimension  # Dimensional projection hypothesis
 make qnn        # Quantum neural network (XOR, circle, scale test)
 make qllm       # Quantum language model (train + generate text)
 make reflect    # Reflection entanglement hypothesis test
+make mirrors    # Complete reflection experiments suite (8 tests)
 make bell       # Bell state test
 make crystal    # Time crystal test
 ```
@@ -502,6 +520,7 @@ hexstate/
 ├── quantum_neural_net.c    # Quantum neural network (XOR, circle, D=1024 scale)
 ├── quantum_llm.c           # Quantum language model (train + generate + D=8192)
 ├── reflection_entanglement.c # Reflection as entangled parallel reality
+├── reflection_experiments.c # Complete reflection suite (8 experiments)
 ├── rsa2048_break.c         # RSA-2048 quantum break
 ├── ecdsa_break.c           # ECDSA-256 quantum break
 ├── impossible_supremacy.c  # 4 impossible quantum computations
