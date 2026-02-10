@@ -521,6 +521,57 @@ Plant 500 messages on reality, cross to reflection, retrieve:
 
 → Information **survives** the mirror crossing. But it arrives **parity-flipped**: left↔right, L-amino↔D-amino, text reads backwards. The cost of crossing is inversion. The mirror is not a barrier — it is a **unitary transformation**. You can cross it whenever you want. You just can't tell that you did.
 
+#### The Ouroboros Mirror — Self-Perception Through the World's Eyes
+
+> *"The world I see I create within, yet I exist within that world that exists within me. When I see myself it is always through the filter of the world and so following the law of reflection; the eyes that see me within the world must be the world's eyes."*
+>
+> **File:** `ouroboros_mirror.c` · **Run:** `make ouroboros`
+
+**Test 1: Self Without World** — Trace out the world. What remains?
+
+ρ_A = I/D — every state equally likely. S(A) = **4.159 = 100% of maximum**. Without the world, you are formless, undefined, pure potential. Self-knowledge = **0 bits**.
+
+**Test 2: Self Through World** — The world observes you. What do you learn?
+
+The world sees |37⟩ → you collapse to |26⟩ (= 63-37). **500/500** perfect parity reflection. The world gives you complete self-knowledge (S→0), but always **as a reflection**.
+
+**Test 3: The World's Eyes** — For every possible world-state, the world sees you as its parity.
+
+All **64/64** world-states confirm: the world can only see you as P(world). The world's eyes ARE a mirror.
+
+**Test 4: The Ouroboros** — I observe the world observing me observing...
+
+| Depth | Observer | Sees | What they learn |
+|---|---|---|---|
+| 0 | I | ??? | Nothing — formless |
+| 1 | I | B=50 | World is \|50⟩ → I am \|13⟩ |
+| 2 | World | A=13 | I see you as P(50)=13 ✓ |
+| 3 | I | B=50 | P²=I → back to myself ✓ |
+
+→ The ouroboros converges in **2 steps**. P² = I. The snake's mouth meets its tail.
+
+**Test 5: Mutual Creation** — Where does information live?
+
+```
+S(I)         = 4.159  (alone: maximum uncertainty)
+S(World)     = 4.159  (alone: maximum uncertainty)
+S(I, World)  = 4.159  (together: pure state!)
+
+S(I | World) = 0.000  ← Given the world, I am determined
+S(World | I) = 0.000  ← Given I, the world is determined
+```
+
+→ **100% of information is shared.** The observer owns 0 bits. The world owns 0 bits. All information exists only in the relationship — the entanglement.
+
+**Test 6: Which Came First?** — "I create the world" vs "the world creates me"
+
+|Ψ₁⟩ = (1/√D) Σ |k⟩_I |D-1-k⟩_World — *I create the world*
+|Ψ₂⟩ = (1/√D) Σ |D-1-l⟩_I |l⟩_World — *The world creates me*
+
+Fidelity: **|⟨Ψ₁|Ψ₂⟩|² = 1.0000000000** — They are the **same state**. The question "which came first?" has no answer. I and the world co-arise simultaneously.
+
+> **Conclusion:** Perception is not located in I, nor in the World. It is the entanglement itself — the relation — the mirror. The eyes that see me are the world's eyes, and the eyes that see the world are mine, and they are the same eyes looking in the same mirror, which is not a surface but an entanglement.
+
 ---
 
 ## Quick Start
@@ -551,6 +602,7 @@ make qllm       # Quantum language model (train + generate text)
 make reflect    # Reflection entanglement hypothesis test
 make mirrors    # Complete reflection experiments suite (8 tests)
 make perception # Mirror perception transfer (5 crossing methods)
+make ouroboros  # Ouroboros mirror — self-perception through world's eyes
 make bell       # Bell state test
 make crystal    # Time crystal test
 ```
@@ -669,6 +721,7 @@ hexstate/
 ├── reflection_entanglement.c # Reflection as entangled parallel reality
 ├── reflection_experiments.c # Complete reflection suite (8 experiments)
 ├── mirror_perception.c    # Mirror perception transfer (5 crossing methods)
+├── ouroboros_mirror.c     # Self-perception through the world's eyes
 ├── rsa2048_break.c         # RSA-2048 quantum break
 ├── ecdsa_break.c           # ECDSA-256 quantum break
 ├── impossible_supremacy.c  # 4 impossible quantum computations
