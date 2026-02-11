@@ -1032,6 +1032,25 @@ void grover_diffusion(HexStateEngine *eng, uint64_t id)
     if (id >= eng->num_chunks) return;
     Chunk *c = &eng->chunks[id];
 
+    /* ── Group-aware Grover diffusion ──
+     * Diffusion operator: G = 2|ψ⟩⟨ψ| - I  where |ψ⟩ = (1/√D)Σ|k⟩
+     * Matrix form: G[j][k] = 2/D - δ_{jk}
+     * This IS a unitary (it's a reflection about the mean). */
+    if (c->hilbert.group) {
+        uint32_t dim = c->hilbert.group->dim;
+        Complex *G = calloc((size_t)dim * dim, sizeof(Complex));
+        double off_diag = 2.0 / (double)dim;
+        for (uint32_t j = 0; j < dim; j++)
+            for (uint32_t k = 0; k < dim; k++)
+                G[j * dim + k] = cmplx(
+                    (j == k) ? (off_diag - 1.0) : off_diag, 0.0);
+        apply_group_unitary(eng, id, G, dim);
+        free(G);
+        printf("  [GROV] Diffusion on group member %u (D=%u) via Hilbert space\n",
+               c->hilbert.group_index, dim);
+        return;
+    }
+
     /* ═══ Resolve Magic Pointer ═══ */
     uint64_t ns = 0;
     Complex *state = resolve_shadow(eng, id, &ns);
