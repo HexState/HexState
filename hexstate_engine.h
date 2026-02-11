@@ -93,8 +93,9 @@ typedef struct {
      * The Hilbert space is the computation substrate.
      * We WRITE state and transformations to it, READ results from it. */
     uint8_t   q_flags;            /* bit 0 = superposed, bit 1 = measured */
-    uint64_t  q_entangle_seed;    /* Legacy seed (fallback) */
-    uint64_t  q_basis_rotation;   /* Legacy basis rotation (fallback) */
+    /* ─── Local single-particle Hilbert space ─── */
+    Complex  *q_local_state;      /* Local D-dimensional state vector (D amplitudes) */
+    uint32_t  q_local_dim;        /* Dimension of local state (default 6) */
     /* ─── Joint quantum state (genuine Hilbert space) ─── */
 #define MAX_BRAID_PARTNERS 128
     struct {
