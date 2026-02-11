@@ -97,14 +97,14 @@ typedef struct {
     Complex  *q_local_state;      /* Local D-dimensional state vector (D amplitudes) */
     uint32_t  q_local_dim;        /* Dimension of local state (default 6) */
     /* ─── Joint quantum state (genuine Hilbert space) ─── */
-#define MAX_BRAID_PARTNERS 128
+#define MAX_BRAID_PARTNERS 1024
     struct {
         Complex  *q_joint_state;  /* Shared 2-particle state: dim² amplitudes */
         uint32_t  q_joint_dim;    /* Dimension of joint state (default 6) */
         uint64_t  q_partner;      /* Partner chunk ID */
         uint8_t   q_which;        /* 0 = A side, 1 = B side of joint state */
     } partners[MAX_BRAID_PARTNERS];
-    uint8_t   num_partners;       /* Number of active braid partners */
+    uint16_t  num_partners;       /* Number of active braid partners */
 } HilbertRef;
 
 /* Chunk: logical unit of quantum state */
