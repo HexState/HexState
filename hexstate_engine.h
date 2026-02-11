@@ -96,10 +96,14 @@ typedef struct {
     uint64_t  q_entangle_seed;    /* Legacy seed (fallback) */
     uint64_t  q_basis_rotation;   /* Legacy basis rotation (fallback) */
     /* ─── Joint quantum state (genuine Hilbert space) ─── */
-    Complex  *q_joint_state;      /* Shared 2-particle state: dim² amplitudes */
-    uint32_t  q_joint_dim;        /* Dimension of joint state (default 6) */
-    uint64_t  q_partner;          /* Partner chunk ID in entangled pair */
-    uint8_t   q_which;            /* 0 = A side, 1 = B side of joint state */
+#define MAX_BRAID_PARTNERS 128
+    struct {
+        Complex  *q_joint_state;  /* Shared 2-particle state: dim² amplitudes */
+        uint32_t  q_joint_dim;    /* Dimension of joint state (default 6) */
+        uint64_t  q_partner;      /* Partner chunk ID */
+        uint8_t   q_which;        /* 0 = A side, 1 = B side of joint state */
+    } partners[MAX_BRAID_PARTNERS];
+    uint8_t   num_partners;       /* Number of active braid partners */
 } HilbertRef;
 
 /* Chunk: logical unit of quantum state */
