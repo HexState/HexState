@@ -672,20 +672,75 @@ void apply_local_unitary(HexStateEngine *eng, uint64_t id,
     uint32_t ns = g->num_nonzero;
     uint32_t my_idx = c->hilbert.group_index;
 
+    /* ═══ Deferred Local Unitary Path ═══
+     * If the base state has ≤ D entries (e.g. GHZ), applying a local
+     * unitary would expand it to ≤ D² entries per member. Instead,
+     * DEFER: store the D×D unitary per member. The state is implicitly:
+     *   |Ψ⟩ = Σ_k α_k · ⊗_m (U_m |index_{m,k}⟩)
+     * Measurement samples from this in O(N × D²). The Hilbert space
+     * holds the math — no expansion needed.
+     *
+     * Eligible when: num_nonzero ≤ dim (sum of ≤ D product states).
+     * We compose with existing deferred unitaries: U_new = U · U_old. */
+    if (ns <= dim && nm >= 2 && !g->no_defer) {
+        Complex *existing = g->deferred_U[my_idx];
+
+        if (!existing) {
+            /* First deferred unitary for this member — just store it */
+            g->deferred_U[my_idx] = calloc((size_t)dim * dim, sizeof(Complex));
+            memcpy(g->deferred_U[my_idx], U, (size_t)dim * dim * sizeof(Complex));
+            g->num_deferred++;
+        } else {
+            /* Compose: U_new = U_applied × U_old (D×D matrix multiply) */
+            Complex *composed = calloc((size_t)dim * dim, sizeof(Complex));
+            for (uint32_t i = 0; i < dim; i++) {
+                for (uint32_t j = 0; j < dim; j++) {
+                    double re = 0.0, im = 0.0;
+                    for (uint32_t k = 0; k < dim; k++) {
+                        re += U[i * dim + k].real * existing[k * dim + j].real
+                            - U[i * dim + k].imag * existing[k * dim + j].imag;
+                        im += U[i * dim + k].real * existing[k * dim + j].imag
+                            + U[i * dim + k].imag * existing[k * dim + j].real;
+                    }
+                    composed[i * dim + j].real = re;
+                    composed[i * dim + j].imag = im;
+                }
+            }
+            free(existing);
+            g->deferred_U[my_idx] = composed;
+        }
+
+        printf("  [LOCAL U] DEFERRED %u×%u unitary for member %u/%u "
+               "(base entries: %u, stored in Hilbert space)\n",
+               dim, dim, my_idx, nm, ns);
+        return;
+    }
+
     /* Maximum output: each entry can split into dim entries */
     uint32_t max_out = ns * dim;
+
+    /* ── Hash table for O(n) deduplication ──
+     * Instead of O(n²) pairwise comparison, we hash each index tuple
+     * and merge amplitudes in O(1) per entry.
+     * Table size: next power of 2 ≥ 2 × max_out for low collision rate */
+    uint32_t ht_size = 1;
+    while (ht_size < max_out * 2) ht_size <<= 1;
+    uint32_t ht_mask = ht_size - 1;
+
+    /* Hash table: each slot stores an index into the output arrays, or UINT32_MAX if empty */
+    uint32_t *ht_slots = malloc(ht_size * sizeof(uint32_t));
+    memset(ht_slots, 0xFF, ht_size * sizeof(uint32_t));  /* fill with UINT32_MAX */
+
     uint32_t *new_indices = calloc((size_t)max_out * nm, sizeof(uint32_t));
     Complex  *new_amps    = calloc(max_out, sizeof(Complex));
     uint32_t  out_count   = 0;
 
     for (uint32_t e = 0; e < ns; e++) {
         uint32_t *old_row = &g->basis_indices[e * nm];
-        uint32_t k = old_row[my_idx];  /* this member's current basis index */
+        uint32_t k = old_row[my_idx];
         Complex  alpha = g->amplitudes[e];
 
-        /* U transforms this member's index: |k⟩ → Σ_j U[j][k] |j⟩ */
         for (uint32_t j = 0; j < dim; j++) {
-            /* New amplitude = α × U[j][k] */
             Complex u_jk = U[j * dim + k];
             Complex new_amp;
             new_amp.real = alpha.real * u_jk.real - alpha.imag * u_jk.imag;
@@ -693,35 +748,53 @@ void apply_local_unitary(HexStateEngine *eng, uint64_t id,
 
             if (cnorm2(new_amp) < 1e-28) continue;
 
-            /* Copy all other members' indices unchanged */
-            uint32_t *new_row = &new_indices[out_count * nm];
-            memcpy(new_row, old_row, nm * sizeof(uint32_t));
-            /* Only change THIS member's index to j */
-            new_row[my_idx] = j;
-            new_amps[out_count] = new_amp;
-            out_count++;
+            /* Build the candidate index tuple in-place:
+             * same as old_row but with my_idx changed to j */
+
+            /* FNV-1a hash of the index tuple */
+            uint32_t hash = 2166136261u;
+            for (uint32_t m = 0; m < nm; m++) {
+                uint32_t val = (m == my_idx) ? j : old_row[m];
+                hash ^= val;
+                hash *= 16777619u;
+            }
+
+            /* Open addressing: linear probe for matching tuple or empty slot */
+            uint32_t slot = hash & ht_mask;
+            for (;;) {
+                if (ht_slots[slot] == UINT32_MAX) {
+                    /* Empty slot — insert new entry */
+                    uint32_t *new_row = &new_indices[out_count * nm];
+                    memcpy(new_row, old_row, nm * sizeof(uint32_t));
+                    new_row[my_idx] = j;
+                    new_amps[out_count] = new_amp;
+                    ht_slots[slot] = out_count;
+                    out_count++;
+                    break;
+                }
+
+                /* Slot occupied — check if tuples match */
+                uint32_t existing = ht_slots[slot];
+                uint32_t *ex_row = &new_indices[existing * nm];
+                int same = 1;
+                for (uint32_t m = 0; m < nm; m++) {
+                    uint32_t val = (m == my_idx) ? j : old_row[m];
+                    if (ex_row[m] != val) { same = 0; break; }
+                }
+                if (same) {
+                    /* Merge amplitudes */
+                    new_amps[existing].real += new_amp.real;
+                    new_amps[existing].imag += new_amp.imag;
+                    break;
+                }
+
+                /* Collision — linear probe */
+                slot = (slot + 1) & ht_mask;
+            }
         }
     }
 
-    /* Deduplicate: merge entries with identical index tuples */
-    for (uint32_t i = 0; i < out_count; i++) {
-        if (cnorm2(new_amps[i]) < 1e-28) continue;
-        for (uint32_t j = i + 1; j < out_count; j++) {
-            if (cnorm2(new_amps[j]) < 1e-28) continue;
-            int same = 1;
-            for (uint32_t m = 0; m < nm; m++) {
-                if (new_indices[i * nm + m] != new_indices[j * nm + m]) {
-                    same = 0; break;
-                }
-            }
-            if (same) {
-                new_amps[i].real += new_amps[j].real;
-                new_amps[i].imag += new_amps[j].imag;
-                new_amps[j].real = 0.0;
-                new_amps[j].imag = 0.0;
-            }
-        }
-    }
+    free(ht_slots);
 
     /* Compact: remove zero entries */
     uint32_t w = 0;
@@ -944,6 +1017,83 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
            base_d, id, hexit_index, c->hilbert.magic_ptr);
 }
 
+/* ─── Materialize Deferred Unitaries ──────────────────────────────────────── */
+/* Forces expansion of all deferred unitaries into the explicit state vector.
+ * After this, num_nonzero = D^N and each amplitude is fully computed.
+ * This MUST be called before any non-local gate. */
+void materialize_deferred(HexStateEngine *eng, HilbertGroup *g)
+{
+    if (!g || g->num_deferred == 0) return;
+
+    uint32_t dim = g->dim;
+
+    /* Set no_defer to prevent re-deferral during expansion */
+    g->no_defer = 1;
+
+    /* Save and clear all deferred unitaries */
+    Complex *saved[MAX_GROUP_MEMBERS];
+    memset(saved, 0, sizeof(saved));
+    for (uint32_t m = 0; m < g->num_members; m++) {
+        saved[m] = g->deferred_U[m];
+        g->deferred_U[m] = NULL;
+    }
+    g->num_deferred = 0;
+
+    /* Apply each saved unitary through the expansion path */
+    for (uint32_t m = 0; m < g->num_members; m++) {
+        if (!saved[m]) continue;
+
+        /* Find the chunk for this member and apply */
+        uint64_t chunk_id = g->member_ids[m];
+        apply_local_unitary(eng, chunk_id, saved[m], dim);
+        free(saved[m]);
+    }
+
+    g->no_defer = 0;  /* Re-enable deferral for future operations */
+
+    printf("  [MATERIALIZE] Expanded deferred unitaries: "
+           "%u entries, %.1f KB\n",
+           g->num_nonzero,
+           (double)g->num_nonzero * (g->num_members * sizeof(uint32_t) + sizeof(Complex)) / 1024.0);
+}
+
+/* ─── Controlled Phase Gate (Non-Local) — DEFERRED ────────────────────────── */
+/* CZ|j,k⟩ = ω^(j·k) |j,k⟩  where ω = e^(2πi/D)
+ *
+ * GENUINELY NON-LOCAL — but we don't need to materialize!
+ * CZ phases cancel in marginals: |ω^(j·k)|² = 1.
+ * At measurement time, after sampling outcome v for member a,
+ * absorb ω^(v·j_b) into member b's deferred unitary via
+ * diagonal left-multiplication: U_b' = diag(ω^(v·0),...,ω^(v·(D-1))) · U_b
+ *
+ * The Hilbert space stores the CZ pair. The math happens at measurement.
+ * Cost: O(D²) per CZ pair during measurement — polynomial, not exponential. */
+void apply_cz_gate(HexStateEngine *eng, uint64_t id_a, uint64_t id_b)
+{
+    if (id_a >= eng->num_chunks || id_b >= eng->num_chunks) return;
+    Chunk *ca = &eng->chunks[id_a];
+    Chunk *cb = &eng->chunks[id_b];
+    HilbertGroup *g = ca->hilbert.group;
+    if (!g || g != cb->hilbert.group) return;
+
+    uint32_t idx_a = ca->hilbert.group_index;
+    uint32_t idx_b = cb->hilbert.group_index;
+
+    /* ═══ DEFERRED: Store the CZ pair — no expansion, no materialization ═══ */
+    if (g->num_cz >= g->cz_cap) {
+        uint32_t new_cap = g->cz_cap ? g->cz_cap * 2 : 64;
+        g->cz_pairs = realloc(g->cz_pairs, new_cap * 2 * sizeof(uint32_t));
+        g->cz_cap = new_cap;
+    }
+    g->cz_pairs[g->num_cz * 2 + 0] = idx_a;
+    g->cz_pairs[g->num_cz * 2 + 1] = idx_b;
+    g->num_cz++;
+
+    printf("  [CZ] DEFERRED non-local gate between members %u and %u "
+           "(stored in Hilbert space, entries unchanged: %u)\n",
+           idx_a, idx_b, g->num_nonzero);
+}
+
 /* ─── Measurement (Born Rule) ─────────────────────────────────────────────── */
 
 uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
@@ -969,6 +1119,202 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
              * just READ the stored result from the Hilbert space */
             if (c->hilbert.q_flags == 0x02) {
                 return eng->measured_values[id];
+            }
+
+            /* ═══ Deferred Measurement Path ═══
+             * When local unitaries are deferred, the state is implicitly:
+             *   |Ψ⟩ = Σ_k α_k · ⊗_m (U_m |index_{m,k}⟩)
+             * We sample ALL members sequentially in O(N × D²):
+             *
+             * Algorithm:
+             * 1. Maintain D complex coefficients c_k (initialized from amplitudes)
+             * 2. For each member m (except last):
+             *    P(v) = Σ_k |c_k|² · |U_m[v, idx_{m,k}]|²   (unitarity kills cross-terms)
+             *    Sample v, update c_k ← c_k · U_m[v, idx_{m,k}]
+             * 3. For last member: P(v) = |Σ_k c_k · U[v, idx_k]|²  (full interference)
+             * 4. Collapse group to single entry.
+             *
+             * Total: O(N × D²) time, O(D) space. The Hilbert space holds the math. */
+            if (g->num_deferred > 0 || g->num_cz > 0) {
+                uint32_t ns = g->num_nonzero;
+                uint32_t nm = g->num_members;
+                uint32_t dim_local = g->dim;
+                /* Allocate tracking arrays */
+                Complex *c_k = calloc(ns, sizeof(Complex));
+                for (uint32_t e = 0; e < ns; e++)
+                    c_k[e] = g->amplitudes[e];
+
+                uint64_t *outcomes = calloc(nm, sizeof(uint64_t));
+                int *measured = calloc(nm, sizeof(int));
+
+                /* Build measurement order: requested member first */
+                uint32_t *order = calloc(nm, sizeof(uint32_t));
+                order[0] = my_idx;
+                uint32_t oi = 1;
+                for (uint32_t m = 0; m < nm; m++)
+                    if (m != my_idx) order[oi++] = m;
+
+                for (uint32_t step = 0; step < nm; step++) {
+                    uint32_t m = order[step];
+                    Complex *U_m = g->deferred_U[m]; /* NULL = identity */
+                    uint32_t members_remaining = nm - step;
+
+                    /* Compute marginal P(v) for this member.
+                     * CZ phases cancel in marginals: |ω^(j·k)|² = 1.
+                     * So the formula is the SAME as without CZ. */
+                    double probs[NUM_BASIS_STATES];
+                    memset(probs, 0, dim_local * sizeof(double));
+
+                    if (members_remaining > 1) {
+                        /* Not last: cross-terms vanish by unitarity */
+                        for (uint32_t v = 0; v < dim_local; v++) {
+                            for (uint32_t e = 0; e < ns; e++) {
+                                uint32_t idx_mk = g->basis_indices[e * nm + m];
+                                Complex u_val;
+                                if (U_m)
+                                    u_val = U_m[v * dim_local + idx_mk];
+                                else
+                                    u_val = (v == idx_mk) ?
+                                        (Complex){1.0, 0.0} : (Complex){0.0, 0.0};
+                                probs[v] += cnorm2(c_k[e]) * cnorm2(u_val);
+                            }
+                        }
+                    } else {
+                        /* LAST member: full quantum interference */
+                        for (uint32_t v = 0; v < dim_local; v++) {
+                            Complex amp = {0.0, 0.0};
+                            for (uint32_t e = 0; e < ns; e++) {
+                                uint32_t idx_mk = g->basis_indices[e * nm + m];
+                                Complex u_val;
+                                if (U_m)
+                                    u_val = U_m[v * dim_local + idx_mk];
+                                else
+                                    u_val = (v == idx_mk) ?
+                                        (Complex){1.0, 0.0} : (Complex){0.0, 0.0};
+                                amp.real += c_k[e].real * u_val.real
+                                          - c_k[e].imag * u_val.imag;
+                                amp.imag += c_k[e].real * u_val.imag
+                                          + c_k[e].imag * u_val.real;
+                            }
+                            probs[v] = cnorm2(amp);
+                        }
+                    }
+
+                    /* Normalize */
+                    double total = 0.0;
+                    for (uint32_t v = 0; v < dim_local; v++) total += probs[v];
+                    if (total > 0.0)
+                        for (uint32_t v = 0; v < dim_local; v++) probs[v] /= total;
+
+                    /* Born rule sample */
+                    double r = prng_uniform(eng);
+                    double cumul = 0.0;
+                    uint32_t result_v = dim_local - 1;
+                    for (uint32_t v = 0; v < dim_local; v++) {
+                        cumul += probs[v];
+                        if (cumul >= r) { result_v = v; break; }
+                    }
+
+                    outcomes[m] = result_v;
+                    measured[m] = 1;
+
+                    /* Update c_k: c_k[e] ← c_k[e] × U_m[result_v, idx_{m,e}] */
+                    for (uint32_t e = 0; e < ns; e++) {
+                        uint32_t idx_mk = g->basis_indices[e * nm + m];
+                        Complex u_val;
+                        if (U_m)
+                            u_val = U_m[result_v * dim_local + idx_mk];
+                        else
+                            u_val = (result_v == idx_mk) ?
+                                (Complex){1.0, 0.0} : (Complex){0.0, 0.0};
+                        Complex old = c_k[e];
+                        c_k[e].real = old.real * u_val.real - old.imag * u_val.imag;
+                        c_k[e].imag = old.real * u_val.imag + old.imag * u_val.real;
+                    }
+
+                    /* ═══ CZ ABSORPTION ═══
+                     * After sampling outcome v for member m, absorb CZ phases
+                     * into unmeasured partners' unitaries.
+                     * CZ(m, b) with outcome v: U_b' = D_v · U_b
+                     * where D_v = diag(ω^(v·0), ω^(v·1), ..., ω^(v·(D-1)))
+                     * This is O(D²) per CZ pair — still polynomial. */
+                    double omega = 2.0 * M_PI / (double)dim_local;
+                    for (uint32_t ci = 0; ci < g->num_cz; ci++) {
+                        uint32_t a = g->cz_pairs[ci * 2 + 0];
+                        uint32_t b = g->cz_pairs[ci * 2 + 1];
+                        uint32_t partner = UINT32_MAX;
+                        if (a == m && !measured[b]) partner = b;
+                        else if (b == m && !measured[a]) partner = a;
+                        if (partner == UINT32_MAX) continue;
+
+                        /* Ensure partner has a deferred unitary to modify */
+                        if (!g->deferred_U[partner]) {
+                            g->deferred_U[partner] = calloc(
+                                (size_t)dim_local * dim_local, sizeof(Complex));
+                            /* Initialize as identity */
+                            for (uint32_t d = 0; d < dim_local; d++)
+                                g->deferred_U[partner][d * dim_local + d] =
+                                    (Complex){1.0, 0.0};
+                            g->num_deferred++;
+                        }
+
+                        /* Left-multiply by D_v: row j gets multiplied by ω^(v·j) */
+                        Complex *U_b = g->deferred_U[partner];
+                        for (uint32_t j = 0; j < dim_local; j++) {
+                            uint32_t phase_idx = ((uint32_t)result_v * j) % dim_local;
+                            if (phase_idx == 0) continue;
+                            double angle = omega * (double)phase_idx;
+                            double c = cos(angle), s = sin(angle);
+                            for (uint32_t k = 0; k < dim_local; k++) {
+                                Complex old = U_b[j * dim_local + k];
+                                U_b[j * dim_local + k].real =
+                                    old.real * c - old.imag * s;
+                                U_b[j * dim_local + k].imag =
+                                    old.real * s + old.imag * c;
+                            }
+                        }
+                    }
+                }
+
+                /* Record all outcomes */
+                for (uint32_t m = 0; m < nm; m++) {
+                    uint64_t mid = g->member_ids[m];
+                    eng->measured_values[mid] = outcomes[m];
+                    eng->chunks[mid].hilbert.q_flags = 0x02;
+                }
+
+                /* Collapse group to single entry */
+                g->num_nonzero = 1;
+                for (uint32_t m = 0; m < nm; m++)
+                    g->basis_indices[m] = (uint32_t)outcomes[m];
+                g->amplitudes[0] = (Complex){1.0, 0.0};
+                g->collapsed = 1;
+
+                /* Free deferred unitaries */
+                for (uint32_t m = 0; m < nm; m++) {
+                    if (g->deferred_U[m]) {
+                        free(g->deferred_U[m]);
+                        g->deferred_U[m] = NULL;
+                    }
+                }
+                g->num_deferred = 0;
+
+                /* Free CZ pairs */
+                if (g->cz_pairs) { free(g->cz_pairs); g->cz_pairs = NULL; }
+                g->num_cz = 0;
+                g->cz_cap = 0;
+
+                uint64_t my_result = outcomes[my_idx];
+
+                printf("  [MEAS] DEFERRED measurement via Hilbert space O((N+E)×D²): "
+                       "member %u/%u => %lu (all %u members determined)\n",
+                       my_idx, nm, my_result, nm);
+
+                free(c_k);
+                free(outcomes);
+                free(measured);
+                free(order);
+                return my_result;
             }
 
             /* Compute marginal probability for this register:
