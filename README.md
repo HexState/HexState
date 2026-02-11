@@ -256,7 +256,6 @@ Google's exact metric for proving quantum supremacy. Computes F\_XEB = D^N × �
 | F\_XEB | 0.0015 | **2.09** |
 | Scale factor | — | **1,393×** higher fidelity |
 
-**File:** [`xeb_test.c`](hexstate/xeb_test.c)  
 **Run:** `./xeb_test 5 10 50`
 
 ### Test 2: Boson Sampling
@@ -270,7 +269,6 @@ Sampling from permanent-hard distributions (#P-hard). 8,192 photons through a ra
 | Time/sample | — | **457 ms** |
 | Classical cost/prob | — | **10^2470 operations** |
 
-**File:** [`boson_sampling.c`](hexstate/boson_sampling.c)  
 **Run:** `./boson_sampling 8192 10 200`
 
 ### Test 3: Quantum Volume
@@ -285,7 +283,6 @@ IBM's standard metric. Random SU(D) circuits at depth d, measuring Heavy Output 
 | Error/gate | ~0.1% | **0%** |
 | Time | — | **167 s** |
 
-**File:** [`qv_test.c`](hexstate/qv_test.c)  
 **Run:** `./qv_test 8192 100 50`
 
 ### Test 4: GHZ Fidelity at Scale
@@ -301,7 +298,6 @@ Verifying genuine N-party entanglement across 8,192 registers.
 | χ² uniformity | Marginal | **PASS (χ²=3.7)** |
 | Entanglement proof | — | **10^6374 × above separable** |
 
-**File:** [`ghz_fidelity.c`](hexstate/ghz_fidelity.c)  
 **Run:** `./ghz_fidelity 8192 500`
 
 ### Test 5: Quantum Teleportation
@@ -317,7 +313,6 @@ Teleporting quantum states across an 8,192-register GHZ chain.
 | Chain correlation | N/A | **1.0000 (all 8,192 agree)** |
 | Time/teleportation | ~minutes | **239 ms** |
 
-**File:** [`teleport_test.c`](hexstate/teleport_test.c)  
 **Run:** `./teleport_test 8192 200`
 
 ### Test 6: Mermin Inequality (N-Party Bell Violation)
@@ -334,7 +329,6 @@ The strongest proof of quantum nonlocality — Bell's theorem generalized to 8,1
 
 The Mermin violation has **3,187 digits** — exceeding the number of atoms in the observable universe (10^80) by a factor of 10^3107.
 
-**File:** [`mermin_test.c`](hexstate/mermin_test.c)  
 **Run:** `./mermin_test 8192 500`
 
 ### Building All Tests
