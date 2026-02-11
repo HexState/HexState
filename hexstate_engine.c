@@ -690,31 +690,31 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
     Chunk *c = &eng->chunks[id];
 
     if (c->hilbert.shadow_state == NULL) {
-        /* ═══ READ from Hilbert space at this Magic Pointer ═══
-         * The quantum state was WRITTEN here by braid_chunks()
-         * and transformed by apply_hadamard(). We READ the
-         * result via Born rule — the Hilbert space gives us
-         * the answer. */
+        /* ═══ READ from Hilbert space ═══ */
 
-        if (c->hilbert.num_partners > 0 && c->hilbert.partners[0].q_joint_state) {
-            /* ── Genuine quantum measurement (Born rule) ──
-             * Sample outcome from first partner, then collapse
-             * ALL partner joint states to the same result.
-             * This is crucial for star-topology GHZ. */
-            Complex *joint = c->hilbert.partners[0].q_joint_state;
-            uint8_t which = c->hilbert.partners[0].q_which;
-            uint32_t dim = c->hilbert.partners[0].q_joint_dim;
-            if (dim == 0) dim = 6;
+        /* ── Group-based measurement: read from shared multi-party state ──
+         * The HilbertGroup IS the Hilbert space. All connected registers
+         * share it. Measurement reads the marginal for this register,
+         * samples via Born rule, and collapses the shared state.
+         * All other members automatically see the collapsed result
+         * because they read from the same memory. No propagation needed. */
+        if (c->hilbert.group) {
+            HilbertGroup *g = c->hilbert.group;
+            uint32_t my_idx = c->hilbert.group_index;
+            uint32_t dim = g->dim;
 
-            /* READ: compute marginal probabilities for our side */
+            /* If group is already collapsed and this member was determined,
+             * just READ the stored result from the Hilbert space */
+            if (c->hilbert.q_flags == 0x02) {
+                return eng->measured_values[id];
+            }
+
+            /* Compute marginal probability for this register:
+             * P(v) = Σ_{entries where my_index == v} |amplitude|² */
             double *probs = calloc(dim, sizeof(double));
-            for (uint32_t me = 0; me < dim; me++) {
-                for (uint32_t them = 0; them < dim; them++) {
-                    uint64_t idx = (which == 0)
-                        ? (uint64_t)them * dim + me
-                        : (uint64_t)me * dim + them;
-                    probs[me] += cnorm2(joint[idx]);
-                }
+            for (uint32_t e = 0; e < g->num_nonzero; e++) {
+                uint32_t my_val = g->basis_indices[e * g->num_members + my_idx];
+                probs[my_val] += cnorm2(g->amplitudes[e]);
             }
 
             /* Born rule: sample from the Hilbert space */
@@ -727,51 +727,60 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
             }
             free(probs);
 
-            /* WRITE collapse back to ALL partner joint states:
-             * Zero all amplitudes incompatible with our outcome.
-             * Each partner's state is automatically determined. */
-            for (uint16_t p = 0; p < c->hilbert.num_partners; p++) {
-                Complex *pj = c->hilbert.partners[p].q_joint_state;
-                uint8_t pw = c->hilbert.partners[p].q_which;
-                uint32_t pd = c->hilbert.partners[p].q_joint_dim;
-                if (!pj || pd == 0) continue;
-
-                double norm = 0.0;
-                for (uint32_t them = 0; them < pd; them++) {
-                    for (uint32_t me = 0; me < pd; me++) {
-                        uint64_t idx = (pw == 0)
-                            ? (uint64_t)them * pd + me
-                            : (uint64_t)me * pd + them;
-                        if ((int)me != result) {
-                            pj[idx] = cmplx(0.0, 0.0);
-                        } else {
-                            norm += cnorm2(pj[idx]);
-                        }
+            /* Collapse the shared state: remove all entries where
+             * this register's index ≠ result. This is a WRITE to the
+             * shared Hilbert space — all other members automatically
+             * see only the surviving amplitudes on their next read. */
+            uint32_t write_pos = 0;
+            for (uint32_t e = 0; e < g->num_nonzero; e++) {
+                uint32_t my_val = g->basis_indices[e * g->num_members + my_idx];
+                if ((int)my_val == result) {
+                    if (write_pos != e) {
+                        memcpy(&g->basis_indices[write_pos * g->num_members],
+                               &g->basis_indices[e * g->num_members],
+                               g->num_members * sizeof(uint32_t));
+                        g->amplitudes[write_pos] = g->amplitudes[e];
                     }
+                    write_pos++;
                 }
-                /* Renormalize surviving amplitudes */
-                if (norm > 0.0) {
-                    double scale = 1.0 / sqrt(norm);
-                    for (uint32_t them = 0; them < pd; them++) {
-                        uint64_t idx = (pw == 0)
-                            ? (uint64_t)them * pd + result
-                            : (uint64_t)result * pd + them;
-                        pj[idx] = cmplx(pj[idx].real * scale,
-                                        pj[idx].imag * scale);
-                    }
+            }
+            g->num_nonzero = write_pos;
+
+            /* Renormalize surviving amplitudes */
+            double norm = 0.0;
+            for (uint32_t e = 0; e < g->num_nonzero; e++)
+                norm += cnorm2(g->amplitudes[e]);
+            if (norm > 0.0) {
+                double scale = 1.0 / sqrt(norm);
+                for (uint32_t e = 0; e < g->num_nonzero; e++) {
+                    g->amplitudes[e].real *= scale;
+                    g->amplitudes[e].imag *= scale;
                 }
             }
 
+            /* Record our measurement */
             eng->measured_values[id] = (uint64_t)result;
-            c->hilbert.q_flags = 0x02;  /* measured */
+            c->hilbert.q_flags = 0x02;
 
-            printf("  [MEAS] READ Hilbert space at Ptr 0x%016lX "
-                   "(side %c, Born rule, D=%u, %u partners) => %d\n",
-                   c->hilbert.magic_ptr, which == 0 ? 'A' : 'B', dim,
-                   c->hilbert.num_partners, result);
+            /* Check if any other group members are now fully determined.
+             * If only 1 nonzero entry left, ALL members are determined. */
+            if (g->num_nonzero == 1) {
+                for (uint32_t m = 0; m < g->num_members; m++) {
+                    uint64_t mid = g->member_ids[m];
+                    uint32_t mval = g->basis_indices[m]; /* only 1 entry */
+                    eng->measured_values[mid] = mval;
+                    eng->chunks[mid].hilbert.q_flags = 0x02;
+                }
+            }
+
+            printf("  [MEAS] READ shared Hilbert space group "
+                   "(member %u/%u, D=%u, %u nonzero remaining) => %d\n",
+                   my_idx, g->num_members, dim, g->num_nonzero, result);
 
             return (uint64_t)result;
         }
+
+
 
         /* ── Born rule on local single-particle Hilbert space ── */
         if (c->hilbert.q_local_state) {
@@ -940,51 +949,218 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
     link->hexit_a = hexit_a;
     link->hexit_b = hexit_b;
 
-    /* ═══ WRITE Bell state to Hilbert space at both Magic Pointers ═══
-     * Allocate a 2-particle joint state: |Ψ⟩ = (1/√6) Σ |k⟩_A |k⟩_B
-     * This IS the quantum state — 36 Complex amplitudes stored at
-     * the Magic Pointer addresses. Both pointers reference the same
-     * Hilbert space sector (shared allocation). */
+    /* ═══ WRITE to Hilbert space via shared multi-party group ═══
+     * Instead of independent pairwise states, all connected registers
+     * share a SINGLE HilbertGroup. The Hilbert space IS the shared
+     * memory — collapse is automatic because all members read from it.
+     *
+     * When braiding A↔B:
+     *   - Neither in a group → create new 2-member group with Bell state
+     *   - One in a group → extend that group to include the other
+     *   - Both in same group → already connected, no-op
+     *   - Both in different groups → merge groups
+     */
     if (eng->chunks[a].hilbert.shadow_state == NULL &&
         eng->chunks[b].hilbert.shadow_state == NULL) {
 
-        /* Check partner capacity */
-        uint16_t pa = eng->chunks[a].hilbert.num_partners;
-        uint16_t pb = eng->chunks[b].hilbert.num_partners;
-        if (pa >= MAX_BRAID_PARTNERS || pb >= MAX_BRAID_PARTNERS) {
-            printf("  [BRAID] ERROR: max partners reached (chunk %lu=%u, chunk %lu=%u)\n",
-                   a, pa, b, pb);
+        HilbertGroup *ga = eng->chunks[a].hilbert.group;
+        HilbertGroup *gb = eng->chunks[b].hilbert.group;
+
+        if (ga && gb && ga == gb) {
+            /* Already in the same group — nothing to do */
+            printf("  [BRAID] Chunks %lu and %lu already share Hilbert space group\n", a, b);
             return;
         }
 
-        /* Allocate joint state in Hilbert space */
-        uint64_t joint_size = (uint64_t)dim * dim;
-        Complex *joint = calloc(joint_size, sizeof(Complex));
-        double amp = 1.0 / sqrt((double)dim);
-        for (uint32_t k = 0; k < dim; k++)
-            joint[k * dim + k] = cmplx(amp, 0.0);  /* |k⟩_A |k⟩_B */
+        if (ga && gb && ga != gb) {
+            /* Both in different groups — merge gb into ga.
+             * For each nonzero entry in gb, find matching members in ga
+             * and combine. For Bell-type braiding, the constraint is:
+             * a's index must equal b's index in the merged state. */
+            uint32_t old_ga_members = ga->num_members;
 
-        /* APPEND to both chunks' partner arrays */
-        eng->chunks[a].hilbert.partners[pa].q_joint_state = joint;
-        eng->chunks[a].hilbert.partners[pa].q_joint_dim = dim;
-        eng->chunks[a].hilbert.partners[pa].q_partner = b;
-        eng->chunks[a].hilbert.partners[pa].q_which = 0;  /* A side */
-        eng->chunks[a].hilbert.num_partners = pa + 1;
+            /* Add gb's non-shared members to ga */
+            for (uint32_t m = 0; m < gb->num_members; m++) {
+                uint64_t mid = gb->member_ids[m];
+                if (mid == a || mid == b) continue;  /* skip shared */
+                /* Check not already in ga */
+                int found = 0;
+                for (uint32_t g = 0; g < ga->num_members; g++)
+                    if (ga->member_ids[g] == mid) { found = 1; break; }
+                if (found) continue;
+                if (ga->num_members >= MAX_GROUP_MEMBERS) continue;
+                ga->member_ids[ga->num_members] = mid;
+                eng->chunks[mid].hilbert.group = ga;
+                eng->chunks[mid].hilbert.group_index = ga->num_members;
+                ga->num_members++;
+            }
 
-        eng->chunks[b].hilbert.partners[pb].q_joint_state = joint;
-        eng->chunks[b].hilbert.partners[pb].q_joint_dim = dim;
-        eng->chunks[b].hilbert.partners[pb].q_partner = a;
-        eng->chunks[b].hilbert.partners[pb].q_which = 1;  /* B side */
-        eng->chunks[b].hilbert.num_partners = pb + 1;
+            /* Rebuild sparse state: keep only entries where a's index == b's index */
+            uint32_t ai = eng->chunks[a].hilbert.group_index;
+            /* Find b's index in ga (it was just added or already there) */
+            uint32_t bi = 0;
+            for (uint32_t g = 0; g < ga->num_members; g++)
+                if (ga->member_ids[g] == b) { bi = g; break; }
 
-        eng->chunks[a].hilbert.q_flags = 0x01;  /* superposed */
-        eng->chunks[b].hilbert.q_flags = 0x01;  /* superposed */
+            /* Filter: keep only entries where index[ai] == index[bi] */
+            uint32_t write_pos = 0;
+            for (uint32_t e = 0; e < ga->num_nonzero; e++) {
+                uint32_t *row = &ga->basis_indices[e * ga->num_members];
+                if (row[ai] == row[bi]) {
+                    if (write_pos != e) {
+                        memcpy(&ga->basis_indices[write_pos * ga->num_members],
+                               row, ga->num_members * sizeof(uint32_t));
+                        ga->amplitudes[write_pos] = ga->amplitudes[e];
+                    }
+                    write_pos++;
+                }
+            }
+            ga->num_nonzero = write_pos;
 
-        printf("  [BRAID] Bell state |Ψ⟩=(1/√%u)Σ|k⟩|k⟩ WRITTEN to Hilbert space (dim=%u, %lu bytes)\n"
-               "          Ptr 0x%016lX (A, slot %u) <-> Ptr 0x%016lX (B, slot %u)\n",
-               dim, dim, joint_size * sizeof(Complex),
-               eng->chunks[a].hilbert.magic_ptr, pa,
-               eng->chunks[b].hilbert.magic_ptr, pb);
+            /* Renormalize */
+            double norm = 0.0;
+            for (uint32_t e = 0; e < ga->num_nonzero; e++)
+                norm += cnorm2(ga->amplitudes[e]);
+            if (norm > 0.0) {
+                double scale = 1.0 / sqrt(norm);
+                for (uint32_t e = 0; e < ga->num_nonzero; e++) {
+                    ga->amplitudes[e].real *= scale;
+                    ga->amplitudes[e].imag *= scale;
+                }
+            }
+
+            /* Free gb's sparse data */
+            free(gb->basis_indices);
+            free(gb->amplitudes);
+            free(gb);
+
+            printf("  [BRAID] MERGED groups via Hilbert space (%u members, %u nonzero)\n",
+                   ga->num_members, ga->num_nonzero);
+
+        } else if (ga && !gb) {
+            /* A is in a group, B is not — extend A's group to include B.
+             * Bell constraint: B's index matches A's index in each entry. */
+            if (ga->num_members >= MAX_GROUP_MEMBERS) {
+                printf("  [BRAID] ERROR: group full (%u members)\n", ga->num_members);
+                return;
+            }
+
+            uint32_t new_idx = ga->num_members;
+            ga->member_ids[new_idx] = b;
+            ga->num_members++;
+            eng->chunks[b].hilbert.group = ga;
+            eng->chunks[b].hilbert.group_index = new_idx;
+            eng->chunks[b].hilbert.q_flags = 0x01;
+
+            /* Expand sparse basis to include B's index */
+            uint32_t ai = eng->chunks[a].hilbert.group_index;
+            uint32_t old_members = new_idx;  /* members before adding B */
+
+            /* Reallocate index arrays for wider rows */
+            uint32_t *new_indices = calloc((size_t)ga->num_nonzero * ga->num_members,
+                                           sizeof(uint32_t));
+            for (uint32_t e = 0; e < ga->num_nonzero; e++) {
+                /* Copy existing indices */
+                memcpy(&new_indices[e * ga->num_members],
+                       &ga->basis_indices[e * old_members],
+                       old_members * sizeof(uint32_t));
+                /* B's index = A's index (Bell constraint) */
+                new_indices[e * ga->num_members + new_idx] =
+                    ga->basis_indices[e * old_members + ai];
+            }
+            free(ga->basis_indices);
+            ga->basis_indices = new_indices;
+
+            printf("  [BRAID] EXTENDED group: chunk %lu joined via Hilbert space "
+                   "(%u members, %u nonzero)\n", b, ga->num_members, ga->num_nonzero);
+
+        } else if (!ga && gb) {
+            /* B is in a group, A is not — extend B's group to include A. */
+            if (gb->num_members >= MAX_GROUP_MEMBERS) {
+                printf("  [BRAID] ERROR: group full (%u members)\n", gb->num_members);
+                return;
+            }
+
+            uint32_t new_idx = gb->num_members;
+            gb->member_ids[new_idx] = a;
+            gb->num_members++;
+            eng->chunks[a].hilbert.group = gb;
+            eng->chunks[a].hilbert.group_index = new_idx;
+            eng->chunks[a].hilbert.q_flags = 0x01;
+
+            uint32_t bi = eng->chunks[b].hilbert.group_index;
+            uint32_t old_members = new_idx;
+
+            uint32_t *new_indices = calloc((size_t)gb->num_nonzero * gb->num_members,
+                                           sizeof(uint32_t));
+            for (uint32_t e = 0; e < gb->num_nonzero; e++) {
+                memcpy(&new_indices[e * gb->num_members],
+                       &gb->basis_indices[e * old_members],
+                       old_members * sizeof(uint32_t));
+                new_indices[e * gb->num_members + new_idx] =
+                    gb->basis_indices[e * old_members + bi];
+            }
+            free(gb->basis_indices);
+            gb->basis_indices = new_indices;
+
+            printf("  [BRAID] EXTENDED group: chunk %lu joined via Hilbert space "
+                   "(%u members, %u nonzero)\n", a, gb->num_members, gb->num_nonzero);
+
+        } else {
+            /* Neither in a group — create new 2-member group with Bell state */
+            HilbertGroup *g = calloc(1, sizeof(HilbertGroup));
+            g->dim = dim;
+            g->num_members = 2;
+            g->member_ids[0] = a;
+            g->member_ids[1] = b;
+            g->num_nonzero = dim;
+            g->sparse_cap = dim;
+            g->basis_indices = calloc((size_t)dim * 2, sizeof(uint32_t));
+            g->amplitudes = calloc(dim, sizeof(Complex));
+
+            double amp = 1.0 / sqrt((double)dim);
+            for (uint32_t k = 0; k < dim; k++) {
+                g->basis_indices[k * 2 + 0] = k;  /* A's index */
+                g->basis_indices[k * 2 + 1] = k;  /* B's index */
+                g->amplitudes[k] = cmplx(amp, 0.0);
+            }
+
+            eng->chunks[a].hilbert.group = g;
+            eng->chunks[a].hilbert.group_index = 0;
+            eng->chunks[b].hilbert.group = g;
+            eng->chunks[b].hilbert.group_index = 1;
+            eng->chunks[a].hilbert.q_flags = 0x01;
+            eng->chunks[b].hilbert.q_flags = 0x01;
+
+            printf("  [BRAID] Bell state WRITTEN to shared Hilbert space group "
+                   "(dim=%u, %u members, %u nonzero, %lu bytes)\n",
+                   dim, 2, dim,
+                   dim * (2 * sizeof(uint32_t) + sizeof(Complex)));
+        }
+
+        /* Also maintain pairwise partner arrays for backward compatibility */
+        uint16_t pa = eng->chunks[a].hilbert.num_partners;
+        uint16_t pb = eng->chunks[b].hilbert.num_partners;
+        if (pa < MAX_BRAID_PARTNERS && pb < MAX_BRAID_PARTNERS) {
+            uint64_t joint_size = (uint64_t)dim * dim;
+            Complex *joint = calloc(joint_size, sizeof(Complex));
+            double amp = 1.0 / sqrt((double)dim);
+            for (uint32_t k = 0; k < dim; k++)
+                joint[k * dim + k] = cmplx(amp, 0.0);
+
+            eng->chunks[a].hilbert.partners[pa].q_joint_state = joint;
+            eng->chunks[a].hilbert.partners[pa].q_joint_dim = dim;
+            eng->chunks[a].hilbert.partners[pa].q_partner = b;
+            eng->chunks[a].hilbert.partners[pa].q_which = 0;
+            eng->chunks[a].hilbert.num_partners = pa + 1;
+
+            eng->chunks[b].hilbert.partners[pb].q_joint_state = joint;
+            eng->chunks[b].hilbert.partners[pb].q_joint_dim = dim;
+            eng->chunks[b].hilbert.partners[pb].q_partner = a;
+            eng->chunks[b].hilbert.partners[pb].q_which = 1;
+            eng->chunks[b].hilbert.num_partners = pb + 1;
+        }
+
     } else {
         /* Shadow-backed: create joint state via Hilbert space too */
         printf("  [BRAID] WARNING: shadow-backed chunks — use infinite for genuine Hilbert space\n");
