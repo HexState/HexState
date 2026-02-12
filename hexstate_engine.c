@@ -3976,17 +3976,20 @@ MerminResult mermin_test(HexStateEngine *eng, uint32_t n_parties,
     uint32_t dim = NUM_BASIS_STATES;
 
     uint64_t quhits = 100000000000000ULL;  /* 100T per register */
-    FILE *sv;
 
     struct timespec t1, t2;
     clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    /* Open /dev/null ONCE and reuse across all shots */
+    FILE *devnull = fopen("/dev/null", "w");
+    FILE *real_stdout = stdout;
 
     /* ── Z-test: measure all N in computational basis, check all agree ── */
     int z_agree = 0;
     for (uint32_t shot = 0; shot < n_shots; shot++) {
         HexStateEngine e;
         engine_init(&e);
-        sv = stdout; stdout = fopen("/dev/null", "w");
+        stdout = devnull;
 
         for (uint32_t p = 0; p < n_parties; p++)
             init_chunk(&e, p, quhits);
@@ -4000,7 +4003,7 @@ MerminResult mermin_test(HexStateEngine *eng, uint32_t n_parties,
             if (val != first) { agree = 0; break; }
         }
 
-        fclose(stdout); stdout = sv;
+        stdout = real_stdout;
 
         if (agree) { z_agree++; r.z_counts[first]++; }
         engine_destroy(&e);
@@ -4015,7 +4018,7 @@ MerminResult mermin_test(HexStateEngine *eng, uint32_t n_parties,
     for (uint32_t shot = 0; shot < n_shots; shot++) {
         HexStateEngine e;
         engine_init(&e);
-        sv = stdout; stdout = fopen("/dev/null", "w");
+        stdout = devnull;
 
         for (uint32_t p = 0; p < n_parties; p++)
             init_chunk(&e, p, quhits);
@@ -4031,12 +4034,14 @@ MerminResult mermin_test(HexStateEngine *eng, uint32_t n_parties,
         for (uint32_t p = 0; p < n_parties; p++)
             total += (int)(measure_chunk(&e, p) % dim);
 
-        fclose(stdout); stdout = sv;
+        stdout = real_stdout;
 
         if (total % (int)dim == 0) x_parity++;
         engine_destroy(&e);
     }
     r.px = (double)x_parity / n_shots;
+
+    fclose(devnull);
 
     /* ── Mermin witness ── */
     r.witness = r.pz + r.px - 1.0;
@@ -4048,6 +4053,7 @@ MerminResult mermin_test(HexStateEngine *eng, uint32_t n_parties,
 
     return r;
 }
+
 
 /* ── mermin_test_print: formatted output ── */
 void mermin_test_print(MerminResult *r)
