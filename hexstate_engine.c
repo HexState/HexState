@@ -1175,8 +1175,22 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
                     memset(probs, 0, dim_local * sizeof(double));
 
                     if (members_remaining > 1) {
-                        /* Not last: cross-terms vanish by unitarity */
+                        /* ═══ COHERENT marginal — preserves DFT phase ═══
+                         * P(v) = |Σ_k c_k · U_m[v, idx_{m,k}]|²
+                         *
+                         * Previous code used incoherent sum (|c_k|²·|U|²)
+                         * claiming "cross-terms vanish by unitarity."
+                         * WRONG: cross-terms only vanish when marginalizing
+                         * over ALL remaining members simultaneously. Once
+                         * c_k carries phase from prior measurements, the
+                         * cross-terms are physical and must be kept.
+                         *
+                         * The coherent formula is exact for GHZ states
+                         * because all members share the same basis index k
+                         * in each branch — there's no multi-outcome sum
+                         * needed for the other members within a branch. */
                         for (uint32_t v = 0; v < dim_local; v++) {
+                            Complex amp = {0.0, 0.0};
                             for (uint32_t e = 0; e < ns; e++) {
                                 uint32_t idx_mk = g->basis_indices[e * nm + m];
                                 Complex u_val;
@@ -1185,11 +1199,15 @@ uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
                                 else
                                     u_val = (v == idx_mk) ?
                                         (Complex){1.0, 0.0} : (Complex){0.0, 0.0};
-                                probs[v] += cnorm2(c_k[e]) * cnorm2(u_val);
+                                amp.real += c_k[e].real * u_val.real
+                                          - c_k[e].imag * u_val.imag;
+                                amp.imag += c_k[e].real * u_val.imag
+                                          + c_k[e].imag * u_val.real;
                             }
+                            probs[v] = cnorm2(amp);
                         }
                     } else {
-                        /* LAST member: full quantum interference */
+                        /* LAST member: full quantum interference (same formula) */
                         for (uint32_t v = 0; v < dim_local; v++) {
                             Complex amp = {0.0, 0.0};
                             for (uint32_t e = 0; e < ns; e++) {
@@ -2810,20 +2828,14 @@ int execute_instruction(HexStateEngine *eng, Instruction instr)
         break;
 
     case OP_BELL_TEST: {
-        uint32_t bell_dim = (op1 > 1) ? (uint32_t)op1 : 6;
-        uint32_t bell_shots = (op2 > 0) ? (uint32_t)op2 * 100 : 500;
-
-        /* 2-party CHSH Bell test */
-        printf("  [BELL TEST] Running CHSH Bell test (D=%u, %u shots)...\n",
-               bell_dim, bell_shots);
-        BellResult br = bell_test(eng, bell_dim, bell_shots);
-        bell_test_print(&br);
-
-        /* N-party Mermin inequality test */
+        /* N-party Mermin inequality — the native Bell test for D=6.
+         * CHSH is wrong for D=6 (qubit subspace captures only 2/6 of
+         * the correlation). Mermin uses the full Hilbert space. */
         uint32_t mermin_parties = (target > 1) ? (uint32_t)target : 20;
-        uint32_t mermin_shots = (bell_shots > 200) ? 200 : bell_shots;
-        printf("  [MERMIN] Running %u-party Mermin inequality test (%u shots)...\n",
-               mermin_parties, mermin_shots);
+        uint32_t mermin_shots = (op2 > 0) ? (uint32_t)op2 * 100 : 200;
+        if (mermin_shots > 500) mermin_shots = 500;
+        printf("  [BELL TEST] Running %u-party Mermin inequality (D=%u, %u shots)...\n",
+               mermin_parties, NUM_BASIS_STATES, mermin_shots);
         MerminResult mr = mermin_test(eng, mermin_parties, mermin_shots);
         mermin_test_print(&mr);
         break;
@@ -3447,18 +3459,16 @@ int run_self_test(HexStateEngine *eng)
         if (!count_ok) pass = 0;
     }
 
-    /* ─── Test 11: Bell Test (Exact CHSH from Hilbert Space) ─── */
-    printf("\n─── Test 11: Bell Test (Exact CHSH from Hilbert Space) ───\n");
+    /* ─── Test 11: Mermin Inequality (N-party, D=6) ─── */
+    printf("\n─── Test 11: Mermin Inequality (N-party GHZ, D=6) ───\n");
     {
-        BellResult br = bell_test(eng, 6, 0);  /* 0 shots = exact only */
-        printf("  Exact S = %.10f (2√2 = %.10f) %s\n",
-               br.exact_S, 2.0 * sqrt(2.0),
-               fabs(br.exact_S - 2.0 * sqrt(2.0)) < 1e-10 ? "✓" : "✗ FAIL");
-        printf("  Exact I_D = %.10f (CGLMP, D=6)\n", br.exact_I_D);
-        printf("  Bell violation: %s\n",
-               br.violation ? "YES ✓ — exact from Hilbert space" : "NO ✗");
-        if (!br.violation) pass = 0;
-        if (fabs(br.exact_S - 2.0 * sqrt(2.0)) > 1e-10) pass = 0;
+        MerminResult mr = mermin_test(eng, 6, 100);  /* 6 parties, 100 shots */
+        printf("  P(Z) = %.4f  P(X) = %.4f  W = %.4f\n",
+               mr.pz, mr.px, mr.witness);
+        printf("  Classical bound: %.4f\n", mr.classical_bound);
+        printf("  Mermin violation: %s\n",
+               mr.violation ? "YES ✓ — N-party entanglement certified" : "NO ✗");
+        if (!mr.violation) pass = 0;
     }
 
     /* ─── Summary ─── */
@@ -3530,37 +3540,11 @@ double hilbert_compute_cglmp(double *P00, double *P01, double *P10, double *P11,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
- * HILBERT-SPACE-NATIVE BELL TEST
+ * DEFERRED UNITARY MANAGEMENT
  *
- * The Bell test is OUTSOURCED TO THE HILBERT SPACE:
- *   • Single HilbertGroup created via braid_chunks_dim
- *   • Measurement bases set via deferred unitaries (no materialization)
- *   • Correlators computed EXACTLY from P(a,b) = |Σ α_k U_A U_B|²
- *   • CHSH: S = 2√2 (Tsirelson bound, exact, zero statistical error)
- *   • CGLMP: I_D from full D-dimensional Hilbert space
- *   • Optional Born-rule sampling for empirical confirmation
- *
- * The quantum state itself declares the Bell violation.
+ * Set/clear D×D unitaries as deferred measurement operators.
+ * Used by the deferred measurement path in measure_chunk.
  * ═══════════════════════════════════════════════════════════════════════════════ */
-
-/* ── Complex arithmetic helpers (inline, engine-local) ── */
-
-static inline Complex bell_cmul(Complex a, Complex b) {
-    return (Complex){a.real*b.real - a.imag*b.imag,
-                     a.real*b.imag + a.imag*b.real};
-}
-
-static inline Complex bell_cadd(Complex a, Complex b) {
-    return (Complex){a.real + b.real, a.imag + b.imag};
-}
-
-static inline double bell_cnorm(Complex a) {
-    return a.real*a.real + a.imag*a.imag;
-}
-
-static inline Complex bell_cconj(Complex a) {
-    return (Complex){a.real, -a.imag};
-}
 
 /* ── Deferred unitary management ── */
 
@@ -3591,328 +3575,17 @@ void hilbert_clear_deferred(HilbertGroup *g, uint32_t member_idx)
     }
 }
 
-/* ── Exact joint probability computation from Hilbert space ── */
 
-void hilbert_exact_joint_probs(HilbertGroup *g, double *probs_out)
-{
-    if (!g || g->num_members < 2) return;
 
-    uint32_t ns  = g->num_nonzero;
-    uint32_t nm  = g->num_members;
-    uint32_t dim = g->dim;
 
-    Complex *U_A = g->deferred_U[0];
-    Complex *U_B = g->deferred_U[1];
 
-    memset(probs_out, 0, (size_t)dim * dim * sizeof(double));
 
-    for (uint32_t a = 0; a < dim; a++) {
-        for (uint32_t b = 0; b < dim; b++) {
-            Complex amp = {0, 0};
-            for (uint32_t e = 0; e < ns; e++) {
-                uint32_t idx_a = g->basis_indices[e * nm + 0];
-                uint32_t idx_b = g->basis_indices[e * nm + 1];
 
-                Complex u_a = U_A ? U_A[a * dim + idx_a]
-                                  : (a == idx_a ? (Complex){1,0} : (Complex){0,0});
-                Complex u_b = U_B ? U_B[b * dim + idx_b]
-                                  : (b == idx_b ? (Complex){1,0} : (Complex){0,0});
 
-                /* α_k · U_A[a, idx_A] · U_B[b, idx_B] */
-                amp = bell_cadd(amp, bell_cmul(g->amplitudes[e],
-                                              bell_cmul(u_a, u_b)));
-            }
-            probs_out[a * dim + b] = bell_cnorm(amp);
-        }
-    }
-}
 
-/* ── Matrix multiplication for D×D unitaries ── */
 
-static void bell_mat_mul(Complex *C, const Complex *A, const Complex *B, uint32_t D)
-{
-    for (uint32_t i = 0; i < D; i++)
-        for (uint32_t j = 0; j < D; j++) {
-            double re = 0, im = 0;
-            for (uint32_t k = 0; k < D; k++) {
-                re += A[i*D+k].real * B[k*D+j].real - A[i*D+k].imag * B[k*D+j].imag;
-                im += A[i*D+k].real * B[k*D+j].imag + A[i*D+k].imag * B[k*D+j].real;
-            }
-            C[i*D+j] = (Complex){re, im};
-        }
-}
 
-/* ── SU(2) rotation in qubit subspace, padded to D×D ── */
 
-static void bell_build_su2(Complex *U, uint32_t D, double theta)
-{
-    memset(U, 0, (size_t)D * D * sizeof(Complex));
-    double ct = cos(theta), st = sin(theta);
-    U[0*D + 0] = (Complex){ ct, 0};
-    U[0*D + 1] = (Complex){-st, 0};
-    U[1*D + 0] = (Complex){ st, 0};
-    U[1*D + 1] = (Complex){ ct, 0};
-    for (uint32_t k = 2; k < D; k++)
-        U[k*D + k] = (Complex){1.0, 0.0};
-}
-
-/* ── DFT matrix for D-dimensional measurements ── */
-
-static void bell_build_dft(Complex *F, uint32_t D)
-{
-    double inv_sqrt_d = 1.0 / sqrt((double)D);
-    for (uint32_t j = 0; j < D; j++)
-        for (uint32_t k = 0; k < D; k++) {
-            double angle = 2.0 * M_PI * j * k / (double)D;
-            F[j*D + k] = (Complex){inv_sqrt_d * cos(angle),
-                                   inv_sqrt_d * sin(angle)};
-        }
-}
-
-/* ── Phase rotation diag(e^{iθ·0}, e^{iθ·1}, ..., e^{iθ·(D-1)}) ── */
-
-static void bell_build_phase(Complex *P, uint32_t D, double theta)
-{
-    memset(P, 0, (size_t)D * D * sizeof(Complex));
-    for (uint32_t k = 0; k < D; k++) {
-        double angle = theta * k;
-        P[k*D + k] = (Complex){cos(angle), sin(angle)};
-    }
-}
-
-/* ═══ Exact CHSH from Hilbert space amplitudes ═══ */
-
-double hilbert_exact_chsh(HilbertGroup *g, double exact_E[4])
-{
-    uint32_t D = g->dim;
-
-    /* CHSH-optimal angles for qubit subspace:
-     * Alice: a₁ = 0,    a₂ = π/4
-     * Bob:   b₁ = π/8,  b₂ = -π/8 (equivalently 3π/8)
-     * These produce E = ±1/√2, yielding S = 2√2 */
-    double alice_angles[2] = {0.0, M_PI / 4.0};
-    double bob_angles[2]   = {M_PI / 8.0, 3.0 * M_PI / 8.0};
-
-    /* Allocate D×D unitaries on the stack (D ≤ 6 typically) */
-    Complex U_A[D * D];
-    Complex U_B[D * D];
-    double probs[D * D];
-
-    int idx = 0;
-    for (int ai = 0; ai < 2; ai++) {
-        bell_build_su2(U_A, D, alice_angles[ai]);
-        for (int bi = 0; bi < 2; bi++) {
-            bell_build_su2(U_B, D, bob_angles[bi]);
-
-            hilbert_set_deferred(g, 0, U_A, D);
-            hilbert_set_deferred(g, 1, U_B, D);
-            hilbert_exact_joint_probs(g, probs);
-            hilbert_clear_deferred(g, 0);
-            hilbert_clear_deferred(g, 1);
-
-            /* CHSH correlator: E = P(0,0) - P(0,1) - P(1,0) + P(1,1)
-             * normalized by qubit subspace probability */
-            double P00 = probs[0*D + 0], P01 = probs[0*D + 1];
-            double P10 = probs[1*D + 0], P11 = probs[1*D + 1];
-            double P_qubit = P00 + P01 + P10 + P11;
-            exact_E[idx] = (P_qubit > 1e-15)
-                         ? (P00 - P01 - P10 + P11) / P_qubit
-                         : 0.0;
-            idx++;
-        }
-    }
-
-    /* S = |E(a₁,b₁) - E(a₁,b₂) + E(a₂,b₁) + E(a₂,b₂)| */
-    double S = fabs(exact_E[0] - exact_E[1] + exact_E[2] + exact_E[3]);
-    return S;
-}
-
-/* ═══ Exact CGLMP I_D from Hilbert space amplitudes ═══ */
-
-double hilbert_exact_cglmp(HilbertGroup *g)
-{
-    uint32_t D = g->dim;
-    if (D < 2) return 0.0;
-
-    /* CGLMP optimal angles:
-     * α₁ = 0, α₂ = π/D, β₁ = π/(2D), β₂ = -π/(2D) */
-    double alpha[2] = {0.0, M_PI / (double)D};
-    double beta[2]  = {M_PI / (2.0 * D), -M_PI / (2.0 * D)};
-
-    Complex F[D*D], F_dag[D*D], Phase[D*D], Temp[D*D];
-    bell_build_dft(F, D);
-
-    for (uint32_t i = 0; i < D; i++)
-        for (uint32_t j = 0; j < D; j++)
-            F_dag[i*D+j] = bell_cconj(F[j*D+i]);
-
-    /* Compute P(a-b ≡ k mod D) for all 4 setting combinations */
-    double P_diff[2][2][D];
-
-    for (int ai = 0; ai < 2; ai++) {
-        Complex U_A[D*D];
-        bell_build_phase(Phase, D, alpha[ai]);
-        bell_mat_mul(Temp, Phase, F, D);
-        bell_mat_mul(U_A, F_dag, Temp, D);
-
-        for (int bi = 0; bi < 2; bi++) {
-            Complex U_B[D*D];
-            bell_build_phase(Phase, D, beta[bi]);
-            bell_mat_mul(Temp, Phase, F, D);
-            bell_mat_mul(U_B, F_dag, Temp, D);
-
-            hilbert_set_deferred(g, 0, U_A, D);
-            hilbert_set_deferred(g, 1, U_B, D);
-            double probs[D * D];
-            hilbert_exact_joint_probs(g, probs);
-            hilbert_clear_deferred(g, 0);
-            hilbert_clear_deferred(g, 1);
-
-            memset(P_diff[ai][bi], 0, D * sizeof(double));
-            for (uint32_t a = 0; a < D; a++)
-                for (uint32_t b = 0; b < D; b++)
-                    P_diff[ai][bi][(a - b + D) % D] += probs[a * D + b];
-        }
-    }
-
-    /* Collins et al. 2002 CGLMP formula:
-     * I_D = Σ_{k=0}^{⌊D/2⌋-1} (1 - 2k/(D-1)) × (pos_k - neg_k) */
-    double I_D = 0;
-    for (uint32_t k = 0; k < D/2; k++) {
-        double w_k = 1.0 - 2.0 * k / (D - 1.0);
-        int Dmk1 = (D - k - 1) % D;
-        int Dmk  = (D - k) % D;
-        int kp1  = (k + 1) % D;
-
-        double pos = P_diff[0][0][k] + P_diff[1][0][Dmk1]
-                   + P_diff[1][1][k] + P_diff[0][1][Dmk];
-        double neg = P_diff[0][0][Dmk1] + P_diff[1][0][k]
-                   + P_diff[1][1][Dmk1] + P_diff[0][1][kp1];
-
-        I_D += w_k * (pos - neg);
-    }
-
-    return I_D;
-}
-
-/* ═══ Engine-level Bell test ═══ */
-
-BellResult bell_test(HexStateEngine *eng, uint32_t dim, uint32_t n_shots)
-{
-    BellResult result = {0};
-    result.dim = dim;
-    result.n_shots = n_shots;
-
-    FILE *sv;
-
-    /* ── Phase 1: Create Bell state in HilbertGroup ── */
-    uint64_t quhits = 100000000000000ULL;  /* 100T */
-    HexStateEngine bell_eng;
-    engine_init(&bell_eng);
-
-    sv = stdout; stdout = fopen("/dev/null", "w");
-    init_chunk(&bell_eng, 0, quhits);
-    init_chunk(&bell_eng, 1, quhits);
-    braid_chunks_dim(&bell_eng, 0, 1, 0, 0, dim);
-    fclose(stdout); stdout = sv;
-
-    HilbertGroup *g = bell_eng.chunks[0].hilbert.group;
-    if (!g) {
-        printf("  [BELL] ERROR: No HilbertGroup created\n");
-        engine_destroy(&bell_eng);
-        return result;
-    }
-
-    /* ── Phase 2: Exact CHSH from Hilbert space amplitudes ── */
-    result.exact_S = hilbert_exact_chsh(g, result.exact_E);
-
-    /* ── Phase 3: Exact CGLMP from full D-dimensional Hilbert space ── */
-    result.exact_I_D = hilbert_exact_cglmp(g);
-
-    result.violation = (result.exact_S > 2.0) ? 1 : 0;
-
-    engine_destroy(&bell_eng);
-
-    /* ── Phase 4: Optional empirical confirmation ── */
-    if (n_shots > 0) {
-        double a1 = 0.0, a2 = M_PI / 4.0;
-        double b1 = M_PI / 8.0, b2 = 3.0 * M_PI / 8.0;
-
-        Complex *gate_a[4], *gate_b[4];
-        for (int i = 0; i < 4; i++) {
-            gate_a[i] = malloc((size_t)dim * dim * sizeof(Complex));
-            gate_b[i] = malloc((size_t)dim * dim * sizeof(Complex));
-        }
-
-        /* (a₁,b₁), (a₁,b₂), (a₂,b₁), (a₂,b₂) */
-        bell_build_su2(gate_a[0], dim, a1);  bell_build_su2(gate_b[0], dim, b1);
-        bell_build_su2(gate_a[1], dim, a1);  bell_build_su2(gate_b[1], dim, b2);
-        bell_build_su2(gate_a[2], dim, a2);  bell_build_su2(gate_b[2], dim, b1);
-        bell_build_su2(gate_a[3], dim, a2);  bell_build_su2(gate_b[3], dim, b2);
-
-        double signs[] = {+1.0, -1.0, +1.0, +1.0};
-
-        result.empirical_S = 0.0;
-        for (int cfg = 0; cfg < 4; cfg++) {
-            int agree_same = 0, agree_diff = 0;
-            for (uint32_t shot = 0; shot < n_shots; shot++) {
-                HexStateEngine e;
-                engine_init(&e);
-                sv = stdout; stdout = fopen("/dev/null", "w");
-                init_chunk(&e, 0, quhits);
-                init_chunk(&e, 1, quhits);
-                braid_chunks_dim(&e, 0, 1, 0, 0, dim);
-                apply_local_unitary(&e, 0, (const Complex *)gate_a[cfg], dim);
-                apply_local_unitary(&e, 1, (const Complex *)gate_b[cfg], dim);
-                uint64_t ma = measure_chunk(&e, 0);
-                uint64_t mb = measure_chunk(&e, 1);
-                fclose(stdout); stdout = sv;
-                engine_destroy(&e);
-
-                uint32_t oa = ma % dim, ob = mb % dim;
-                if (oa < 2 && ob < 2) {
-                    if (oa == ob) agree_same++; else agree_diff++;
-                }
-            }
-            int total = agree_same + agree_diff;
-            result.empirical_E[cfg] = (total > 0)
-                ? (double)(agree_same - agree_diff) / total : 0.0;
-            result.empirical_S += signs[cfg] * result.empirical_E[cfg];
-        }
-        result.empirical_S = fabs(result.empirical_S);
-
-        for (int i = 0; i < 4; i++) { free(gate_a[i]); free(gate_b[i]); }
-    }
-
-    return result;
-}
-
-void bell_test_print(BellResult *r)
-{
-    printf("  ── Hilbert-Space-Native Bell Test (D=%u) ──\n\n", r->dim);
-
-    printf("    EXACT (from Hilbert space amplitudes, zero statistical error):\n");
-    const char *labels[] = {"E(a₁,b₁)", "E(a₁,b₂)", "E(a₂,b₁)", "E(a₂,b₂)"};
-    for (int i = 0; i < 4; i++)
-        printf("      %s = %+.10f\n", labels[i], r->exact_E[i]);
-    printf("      S = %.10f  (classical bound: 2.0, Tsirelson: 2√2 ≈ 2.8284)\n",
-           r->exact_S);
-    printf("      I_D = %.10f  (CGLMP, full D=%u)\n", r->exact_I_D, r->dim);
-
-    if (r->violation)
-        printf("      ★ BELL VIOLATION: S = 2√2 — exact from Hilbert space ★\n");
-    else
-        printf("      S ≤ 2 (no violation)\n");
-
-    if (r->n_shots > 0) {
-        printf("\n    EMPIRICAL (%u shots per setting, for confirmation):\n", r->n_shots);
-        for (int i = 0; i < 4; i++)
-            printf("      %s = %+.6f\n", labels[i], r->empirical_E[i]);
-        printf("      S_emp = %.6f  (%.1f%% of exact)\n",
-               r->empirical_S, 100.0 * r->empirical_S / r->exact_S);
-    }
-    printf("\n");
-}
 
 
 
