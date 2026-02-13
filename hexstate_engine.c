@@ -1107,6 +1107,10 @@ void apply_cz_gate(HexStateEngine *eng, uint64_t id_a, uint64_t id_b)
 
 uint64_t measure_chunk(HexStateEngine *eng, uint64_t id)
 {
+    /* Auto-initialize infinite chunk if it doesn't exist yet */
+    if (id >= eng->num_chunks && id < MAX_CHUNKS) {
+        op_infinite_resources(eng, id, 0);
+    }
     if (id >= eng->num_chunks) return 0;
     Chunk *c = &eng->chunks[id];
 
@@ -1598,6 +1602,16 @@ void braid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b,
 void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
                       uint64_t hexit_a, uint64_t hexit_b, uint32_t dim)
 {
+    /* Auto-initialize infinite chunks if they don't exist yet.
+     * This allows experiments to use chunk IDs directly without
+     * calling init_chunk first — the engine auto-provisions them
+     * as infinite chunks with q_local_state (D=6 Born-rule ready). */
+    if (a >= eng->num_chunks && a < MAX_CHUNKS) {
+        op_infinite_resources(eng, a, 0);
+    }
+    if (b >= eng->num_chunks && b < MAX_CHUNKS) {
+        op_infinite_resources(eng, b, 0);
+    }
     if (a >= eng->num_chunks || b >= eng->num_chunks) return;
     if (dim == 0) dim = 6;
 
