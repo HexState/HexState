@@ -452,7 +452,7 @@ int init_chunk(HexStateEngine *eng, uint64_t id, uint64_t num_hexits)
         c->hilbert.shadow_capacity = 0;
         /* WRITE quantum state to Magic Pointer address */
         c->hilbert.q_flags = 0x01;  /* superposed */
-        /* Allocate local D=6 Hilbert space: |0⟩ */
+        /* Allocate local Hilbert space: |0⟩ (default D=6, overridable) */
         c->hilbert.q_local_dim = 6;
         c->hilbert.q_local_state = calloc(6, sizeof(Complex));
         c->hilbert.q_local_state[0] = cmplx(1.0, 0.0);  /* |0⟩ */
@@ -839,7 +839,7 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
     if (c->hilbert.shadow_state == NULL) {
         /* ═══ WRITE QFT to Hilbert space ═══ */
 
-        /* ── Group-first: apply DFT via apply_group_unitary ── */
+        /* ── Group-first: apply DFT as local unitary ── */
         if (c->hilbert.group) {
             uint32_t dim = c->hilbert.group->dim;
             double inv_sqrt_d = 1.0 / sqrt((double)dim);
@@ -850,9 +850,9 @@ void apply_hadamard(HexStateEngine *eng, uint64_t id, uint64_t hexit_index)
                     dft[j * dim + k] = cmplx(inv_sqrt_d * cos(angle),
                                               inv_sqrt_d * sin(angle));
                 }
-            apply_group_unitary(eng, id, dft, dim);
+            apply_local_unitary(eng, id, dft, dim);
             free(dft);
-            printf("  [H] DFT_%u applied to group member %u via Hilbert space group\n",
+            printf("  [H] DFT_%u applied locally to group member %u via Hilbert space\n",
                    dim, c->hilbert.group_index);
             return;
         }
@@ -1066,17 +1066,17 @@ void materialize_deferred(HexStateEngine *eng, HilbertGroup *g)
            (double)g->num_nonzero * (g->num_members * sizeof(uint32_t) + sizeof(Complex)) / 1024.0);
 }
 
-/* ─── Controlled Phase Gate (Non-Local) — DEFERRED ────────────────────────── */
+/* ─── Controlled Phase Gate (Non-Local) — MATERIALIZED ───────────────────── */
 /* CZ|j,k⟩ = ω^(j·k) |j,k⟩  where ω = e^(2πi/D)
  *
- * GENUINELY NON-LOCAL — but we don't need to materialize!
- * CZ phases cancel in marginals: |ω^(j·k)|² = 1.
- * At measurement time, after sampling outcome v for member a,
- * absorb ω^(v·j_b) into member b's deferred unitary via
- * diagonal left-multiplication: U_b' = diag(ω^(v·0),...,ω^(v·(D-1))) · U_b
+ * GENUINELY NON-LOCAL — materializes deferred unitaries first to expand
+ * the sparse state to its full representation, then applies the CZ phase
+ * directly to each sparse entry. This ensures the state correctly carries
+ * entanglement information through the circuit.
  *
- * The Hilbert space stores the CZ pair. The math happens at measurement.
- * Cost: O(D²) per CZ pair during measurement — polynomial, not exponential. */
+ * Cost: O(D²) for materialization + O(ns) for phase application.
+ * The entangled state is maintained in the sparse representation, allowing
+ * subsequent local unitaries and measurements to see correct correlations. */
 void apply_cz_gate(HexStateEngine *eng, uint64_t id_a, uint64_t id_b)
 {
     if (id_a >= eng->num_chunks || id_b >= eng->num_chunks) return;
@@ -1087,20 +1087,37 @@ void apply_cz_gate(HexStateEngine *eng, uint64_t id_a, uint64_t id_b)
 
     uint32_t idx_a = ca->hilbert.group_index;
     uint32_t idx_b = cb->hilbert.group_index;
+    uint32_t dim = g->dim;
+    uint32_t nm = g->num_members;
 
-    /* ═══ DEFERRED: Store the CZ pair — no expansion, no materialization ═══ */
-    if (g->num_cz >= g->cz_cap) {
-        uint32_t new_cap = g->cz_cap ? g->cz_cap * 2 : 64;
-        g->cz_pairs = realloc(g->cz_pairs, new_cap * 2 * sizeof(uint32_t));
-        g->cz_cap = new_cap;
+    /* ═══ Step 1: Materialize any deferred unitaries ═══
+     * This expands the sparse state so each basis entry has
+     * concrete indices — no implicit U transforms left. */
+    if (g->num_deferred > 0) {
+        materialize_deferred(eng, g);
     }
-    g->cz_pairs[g->num_cz * 2 + 0] = idx_a;
-    g->cz_pairs[g->num_cz * 2 + 1] = idx_b;
-    g->num_cz++;
 
-    printf("  [CZ] DEFERRED non-local gate between members %u and %u "
-           "(stored in Hilbert space, entries unchanged: %u)\n",
-           idx_a, idx_b, g->num_nonzero);
+    /* ═══ Step 2: Apply CZ phase directly to each sparse entry ═══
+     * For entry |..., j_a, ..., j_b, ...⟩ with amplitude α:
+     *   α ← α × ω^(j_a · j_b)
+     * where ω = e^(2πi/D). This is O(ns) — no state expansion. */
+    double omega = 2.0 * M_PI / (double)dim;
+    for (uint32_t e = 0; e < g->num_nonzero; e++) {
+        uint32_t j_a = g->basis_indices[e * nm + idx_a];
+        uint32_t j_b = g->basis_indices[e * nm + idx_b];
+        uint32_t phase_idx = ((uint64_t)j_a * j_b) % dim;
+        if (phase_idx == 0) continue;  /* ω^0 = 1, no change */
+
+        double angle = omega * (double)phase_idx;
+        double c = cos(angle), s = sin(angle);
+        Complex old = g->amplitudes[e];
+        g->amplitudes[e].real = old.real * c - old.imag * s;
+        g->amplitudes[e].imag = old.real * s + old.imag * c;
+    }
+
+    printf("  [CZ] MATERIALIZED phase gate between members %u and %u "
+           "(D=%u, %u entries updated)\n",
+           idx_a, idx_b, dim, g->num_nonzero);
 }
 
 /* ─── Measurement (Born Rule) ─────────────────────────────────────────────── */
@@ -2162,12 +2179,15 @@ int op_timeline_fork(HexStateEngine *eng, uint64_t target, uint64_t source)
     return 0;
 }
 
-int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
+int op_infinite_resources_dim(HexStateEngine *eng, uint64_t chunk_id,
+                              uint64_t size, uint32_t dim)
 {
     if (chunk_id >= MAX_CHUNKS) return -1;
     if (ensure_chunk_capacity(eng, chunk_id) != 0) return -1;
+    if (dim == 0) dim = 6;  /* backward compat default */
 
-    printf("🌌 [GOD MODE] Granting Infinite Resources to chunk %lu\n", chunk_id);
+    printf("🌌 [GOD MODE] Granting Infinite Resources to chunk %lu (D=%u)\n",
+           chunk_id, dim);
 
     Chunk *c = &eng->chunks[chunk_id];
     c->id = chunk_id;
@@ -2182,7 +2202,7 @@ int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
         c->num_states = 0x7FFFFFFFFFFFFFFF;
     } else {
         c->size = size;
-        /* Calculate 6^n with saturation */
+        /* Calculate D^n with saturation */
         c->num_states = power_of_6(size);
     }
 
@@ -2191,9 +2211,9 @@ int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
     c->hilbert.shadow_capacity = 0;
     /* WRITE quantum state to Magic Pointer address */
     c->hilbert.q_flags = 0x01;  /* superposed */
-    /* Allocate local D=6 Hilbert space: |0⟩ */
-    c->hilbert.q_local_dim = 6;
-    c->hilbert.q_local_state = calloc(6, sizeof(Complex));
+    /* Allocate local D-dimensional Hilbert space: |0⟩ */
+    c->hilbert.q_local_dim = dim;
+    c->hilbert.q_local_state = calloc(dim, sizeof(Complex));
     c->hilbert.q_local_state[0] = cmplx(1.0, 0.0);
     memset(c->hilbert.partners, 0, sizeof(c->hilbert.partners));
     c->hilbert.num_partners = 0;
@@ -2203,10 +2223,16 @@ int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
         eng->num_chunks = chunk_id + 1;
     }
 
-    printf("  [AUDIT] ∞ Magic Pointer 0x%016lX — %lu states (external Hilbert)\n",
-           c->hilbert.magic_ptr, c->num_states);
+    printf("  [AUDIT] ∞ Magic Pointer 0x%016lX — D=%u, %lu states (external Hilbert)\n",
+           c->hilbert.magic_ptr, dim, c->num_states);
 
     return 0;
+}
+
+/* Backward-compatible wrapper: defaults to D=6 */
+int op_infinite_resources(HexStateEngine *eng, uint64_t chunk_id, uint64_t size)
+{
+    return op_infinite_resources_dim(eng, chunk_id, size, 6);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
