@@ -287,6 +287,8 @@ void unbraid_chunks(HexStateEngine *eng, uint64_t a, uint64_t b);
 /* Multiverse operations */
 int  op_timeline_fork(HexStateEngine *eng, uint64_t target, uint64_t source);
 int  op_infinite_resources(HexStateEngine *eng, uint64_t chunk, uint64_t size);
+int  op_infinite_resources_dim(HexStateEngine *eng, uint64_t chunk,
+                                uint64_t size, uint32_t dim);
 
 /* Oracle registry */
 int  oracle_register(HexStateEngine *eng, uint32_t oracle_id,
