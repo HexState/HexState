@@ -219,6 +219,22 @@ typedef struct {
 
 /* ─── Engine State ────────────────────────────────────────────────────────── */
 
+/* Self-describing Hilbert space entry types (used by quhit registers) */
+#define MAX_QUHIT_HILBERT_ENTRIES 1296   /* D^4: bulk × 3 individually-addressed quhits */
+#define MAX_ADDR_PER_ENTRY 3        /* individually-addressed quhits per basis state */
+
+typedef struct {
+    uint64_t quhit_idx;         /* Magic Pointer address of this quhit */
+    uint32_t value;             /* This quhit's value in this basis state */
+} QuhitAddrValue;
+
+typedef struct {
+    Complex        amplitude;
+    uint32_t       bulk_value;                    /* Value shared by all bulk quhits */
+    uint8_t        num_addr;                      /* How many quhits have individual values */
+    QuhitAddrValue addr[MAX_ADDR_PER_ENTRY];      /* Sparse per-quhit values */
+} QuhitBasisEntry;
+
 typedef struct HexStateEngine_s {
     /* Chunks (dynamically allocated via mmap) */
     Chunk           *chunks;
@@ -260,27 +276,25 @@ typedef struct HexStateEngine_s {
      * The quantum state is stored directly as sparse amplitudes.
      * Operations (measure, DFT, braid) work on the amplitudes.
      *
-     * Tensor product encoding:
-     *   promoted_quhit == -1: "bulk" mode — entry_value = k means ALL quhits = k
-     *   promoted_quhit >= 0:  entry_value = v_promoted * D + v_bulk
-     *     v_promoted = value of the individually-addressed quhit
-     *     v_bulk     = value shared by all other quhits
-     *   This lets one quhit be individually operated (DFT, measure)
-     *   while the rest remain in GHZ bulk — resolving through the same space. */
-#define MAX_QUHIT_HILBERT_ENTRIES 36  /* D² — full tensor product for 1 promoted + bulk */
+     * Self-describing Hilbert space entries:
+     *   Each entry IS the hardware — it carries its own basis state.
+     *   - bulk_value: shared by all quhits not individually addressed
+     *   - addr[]: sparse map of {Magic Pointer address → value} for
+     *     quhits that have been individually gated
+     *   - amplitude: complex coefficient
+     *   Quhit values are lazily resolved at query time by scanning
+     *   the entry's address map — the same way the full state vector
+     *   is lazily resolved through Magic Pointers. No metadata needed. */
     struct {
         uint64_t  chunk_id;                   /* Parent chunk ID */
         uint64_t  n_quhits;                   /* Number of Magic Pointer quhits */
         uint32_t  dim;                        /* Dimension per quhit (D=6) */
-        /* ─── The Hilbert Space ─── */
-        uint32_t  num_nonzero;                /* Nonzero amplitude entries */
-        uint32_t  entry_value[MAX_QUHIT_HILBERT_ENTRIES]; /* Basis value per entry */
-        Complex   amplitudes[MAX_QUHIT_HILBERT_ENTRIES];  /* Complex amplitudes */
+        /* ─── The Hilbert Space (self-describing hardware) ─── */
+        uint32_t          num_nonzero;
+        QuhitBasisEntry   entries[MAX_QUHIT_HILBERT_ENTRIES];
         uint8_t   collapsed;                  /* 1 = measurement has occurred */
         uint32_t  collapse_outcome;           /* Determined value (all members) */
         uint64_t  magic_base;                 /* Base Magic Pointer for this register */
-        /* ─── Per-Quhit Tensor Product Tracking ─── */
-        int64_t   promoted_quhit;             /* -1 = all bulk, ≥0 = this quhit is individually tracked */
     } quhit_regs[MAX_QUHIT_REGISTERS];
     uint32_t        num_quhit_regs;
 } HexStateEngine;
