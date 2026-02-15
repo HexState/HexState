@@ -4794,13 +4794,13 @@ int init_quhit_register(HexStateEngine *eng, uint64_t chunk_id,
     eng->quhit_regs[reg_idx].n_quhits   = n_quhits;
     eng->quhit_regs[reg_idx].dim        = dim;
     eng->quhit_regs[reg_idx].num_nonzero = 1;
-    eng->quhit_regs[reg_idx].entry_value[0] = 0; /* all quhits in |0⟩ */
-    eng->quhit_regs[reg_idx].amplitudes[0].real = 1.0;
-    eng->quhit_regs[reg_idx].amplitudes[0].imag = 0.0;
+    memset(&eng->quhit_regs[reg_idx].entries[0], 0, sizeof(QuhitBasisEntry));
+    eng->quhit_regs[reg_idx].entries[0].amplitude.real = 1.0;
+    eng->quhit_regs[reg_idx].entries[0].bulk_value = 0;  /* all quhits in |0⟩ */
+    eng->quhit_regs[reg_idx].entries[0].num_addr = 0;
     eng->quhit_regs[reg_idx].collapsed  = 0;
     eng->quhit_regs[reg_idx].collapse_outcome = 0;
     eng->quhit_regs[reg_idx].magic_base = MAKE_MAGIC_PTR(chunk_id << 16);
-    eng->quhit_regs[reg_idx].promoted_quhit = -1; /* All bulk — no individually tracked quhit */
     eng->num_quhit_regs++;
 
     printf("  [QUHIT] ✓ %lu Magic Pointer quhits ready\n",
@@ -4812,6 +4812,11 @@ int init_quhit_register(HexStateEngine *eng, uint64_t chunk_id,
     return 0;
 }
 
+/* Forward declarations for helpers used by entangle_all */
+static inline int same_basis(const QuhitBasisEntry *a, const QuhitBasisEntry *b);
+static inline void accumulate_entry(
+    QuhitBasisEntry *arr, uint32_t *n, const QuhitBasisEntry *e);
+
 void entangle_all_quhits(HexStateEngine *eng, uint64_t chunk_id)
 {
     int r = find_quhit_reg(eng, chunk_id);
@@ -4822,23 +4827,56 @@ void entangle_all_quhits(HexStateEngine *eng, uint64_t chunk_id)
     }
 
     uint32_t dim = eng->quhit_regs[r].dim;
+    uint32_t nz  = eng->quhit_regs[r].num_nonzero;
     if (dim > MAX_QUHIT_HILBERT_ENTRIES) dim = MAX_QUHIT_HILBERT_ENTRIES;
 
-    /* Write GHZ state to the Hilbert space:
-     * |GHZ⟩ = (1/√D) Σ_k |k,k,...,k⟩
-     * All quhits are bulk — entry_value = k means "every quhit has value k" */
-    double inv_sqrt_d = 1.0 / sqrt((double)dim);
-    eng->quhit_regs[r].num_nonzero = dim;
-    for (uint32_t k = 0; k < dim; k++) {
-        eng->quhit_regs[r].entry_value[k] = k;
-        eng->quhit_regs[r].amplitudes[k].real = inv_sqrt_d;
-        eng->quhit_regs[r].amplitudes[k].imag = 0.0;
-    }
-    eng->quhit_regs[r].collapsed = 0;
-    eng->quhit_regs[r].promoted_quhit = -1;  /* All bulk — GHZ symmetry */
+    /* ── Unitary entanglement: DFT on the bulk value ──
+     *
+     * The bulk value is shared by all quhits not individually addressed
+     * in each entry. Applying a DFT to the bulk degree of freedom
+     * puts ALL bulk quhits into correlated superposition simultaneously.
+     *
+     * From |0,0,...,0⟩ (bulk=0, single entry):
+     *   → (1/√D) Σ_k |k,k,...,k⟩   = GHZ state
+     *
+     * From an existing state with individually-addressed quhits:
+     *   → preserves addr[] data, only DFTs the bulk degree of freedom.
+     *
+     * This is a proper unitary — no information is destroyed.
+     * Then apply CZ between quhit pair (0,1) for phase correlations. */
 
-    printf("  [QUHIT] ✓ GHZ state written to Hilbert space: %lu quhits entangled\n",
-           (unsigned long)eng->quhit_regs[r].n_quhits);
+    double inv_sqrt_d = 1.0 / sqrt((double)dim);
+    double omega = 2.0 * M_PI / (double)dim;
+
+    QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
+    uint32_t new_nz = 0;
+
+    for (uint32_t e = 0; e < nz; e++) {
+        QuhitBasisEntry *cur = &eng->quhit_regs[r].entries[e];
+        uint32_t v = cur->bulk_value;  /* current bulk value */
+
+        for (uint32_t j = 0; j < dim && new_nz < MAX_QUHIT_HILBERT_ENTRIES; j++) {
+            double phase = omega * v * j;
+            double cr = cos(phase) * inv_sqrt_d;
+            double ci = sin(phase) * inv_sqrt_d;
+
+            QuhitBasisEntry ne = *cur;   /* preserve addr[] data */
+            ne.bulk_value = j;
+            ne.amplitude.real = cur->amplitude.real * cr - cur->amplitude.imag * ci;
+            ne.amplitude.imag = cur->amplitude.real * ci + cur->amplitude.imag * cr;
+
+            accumulate_entry(new_entries, &new_nz, &ne);
+        }
+    }
+
+    memcpy(eng->quhit_regs[r].entries, new_entries,
+           new_nz * sizeof(QuhitBasisEntry));
+    eng->quhit_regs[r].num_nonzero = new_nz;
+    eng->quhit_regs[r].collapsed = 0;
+
+    printf("  [QUHIT] ✓ Entangled via DFT-bulk: %lu quhits, %u entries\n",
+           (unsigned long)eng->quhit_regs[r].n_quhits,
+           eng->quhit_regs[r].num_nonzero);
 }
 
 uint64_t resolve_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx)
@@ -4859,26 +4897,76 @@ uint64_t resolve_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_id
     return eng->quhit_regs[r].magic_base | quhit_idx;
 }
 
-/* ─── Tensor product decoding helpers ─── */
+/* ─── Self-describing Hilbert space helpers ─── */
 
-/* Extract the value of a specific quhit from a composite entry_value.
- * promoted_quhit == -1: bulk mode, entry_value = k, all quhits have value k
- * promoted_quhit >= 0: entry_value = v_promoted * D + v_bulk
- *   If quhit_idx == promoted_quhit: return v_promoted
- *   Otherwise (bulk quhit): return v_bulk */
-static inline uint32_t decode_quhit_value(uint32_t entry_val, uint32_t dim,
-                                           int64_t promoted, uint64_t quhit_idx)
+/* Lazily resolve a quhit's value from a self-describing entry.
+ * Scans the entry's address map; returns the individual value if found,
+ * otherwise returns bulk_value. No metadata needed — the entry IS the hardware. */
+static inline uint32_t lazy_resolve(const QuhitBasisEntry *e, uint64_t quhit_idx)
 {
-    if (promoted < 0) return entry_val;  /* All bulk — every quhit = entry_val */
-    if ((int64_t)quhit_idx == promoted)
-        return entry_val / dim;  /* Promoted quhit's value */
-    return entry_val % dim;      /* Bulk value */
+    for (uint8_t i = 0; i < e->num_addr; i++) {
+        if (e->addr[i].quhit_idx == quhit_idx)
+            return e->addr[i].value;
+    }
+    return e->bulk_value;
 }
 
-/* Encode a composite entry_value from promoted and bulk values */
-static inline uint32_t encode_entry(uint32_t v_promoted, uint32_t v_bulk, uint32_t dim)
+/* Create a new entry with one quhit's value overridden.
+ * If quhit_idx is already in addr[], update it.
+ * If not, add it (if room). The entry self-describes what changed. */
+static inline QuhitBasisEntry entry_with_value(
+    const QuhitBasisEntry *base, uint64_t quhit_idx, uint32_t new_value, Complex amp)
 {
-    return v_promoted * dim + v_bulk;
+    QuhitBasisEntry e = *base;
+    e.amplitude = amp;
+    for (uint8_t i = 0; i < e.num_addr; i++) {
+        if (e.addr[i].quhit_idx == quhit_idx) {
+            e.addr[i].value = new_value;
+            return e;
+        }
+    }
+    if (e.num_addr < MAX_ADDR_PER_ENTRY) {
+        e.addr[e.num_addr].quhit_idx = quhit_idx;
+        e.addr[e.num_addr].value = new_value;
+        e.num_addr++;
+    }
+    return e;
+}
+
+/* Check if two entries represent the same basis state (ignoring amplitude). */
+static inline int same_basis(const QuhitBasisEntry *a, const QuhitBasisEntry *b)
+{
+    if (a->bulk_value != b->bulk_value) return 0;
+    if (a->num_addr != b->num_addr) return 0;
+    for (uint8_t i = 0; i < a->num_addr; i++) {
+        int found = 0;
+        for (uint8_t j = 0; j < b->num_addr; j++) {
+            if (a->addr[i].quhit_idx == b->addr[j].quhit_idx &&
+                a->addr[i].value == b->addr[j].value) {
+                found = 1; break;
+            }
+        }
+        if (!found) return 0;
+    }
+    return 1;
+}
+
+/* Accumulate a new entry into the output buffer.
+ * If same basis state exists, add amplitudes. Otherwise create new slot. */
+static inline void accumulate_entry(
+    QuhitBasisEntry *out, uint32_t *nz, const QuhitBasisEntry *e)
+{
+    for (uint32_t n = 0; n < *nz; n++) {
+        if (same_basis(&out[n], e)) {
+            out[n].amplitude.real += e->amplitude.real;
+            out[n].amplitude.imag += e->amplitude.imag;
+            return;
+        }
+    }
+    if (*nz < MAX_QUHIT_HILBERT_ENTRIES) {
+        out[*nz] = *e;
+        (*nz)++;
+    }
 }
 
 uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_idx)
@@ -4889,24 +4977,22 @@ uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_id
 
     uint32_t dim = eng->quhit_regs[r].dim;
     uint32_t nz  = eng->quhit_regs[r].num_nonzero;
-    int64_t  promoted = eng->quhit_regs[r].promoted_quhit;
 
-    /* If already fully collapsed, return the determined value */
+    /* If already fully collapsed, lazily resolve from the surviving entry */
     if (eng->quhit_regs[r].collapsed) {
-        return (uint64_t)decode_quhit_value(
-            eng->quhit_regs[r].collapse_outcome, dim, promoted, quhit_idx);
+        return (uint64_t)lazy_resolve(&eng->quhit_regs[r].entries[0], quhit_idx);
     }
 
-    /* Step 1: Compute marginal P(v) for the TARGET quhit.
-     * Sum |amplitude|² over all entries where the target quhit has value v. */
-    double probs[36] = {0};
+    /* Step 1: Compute marginal P(v) — lazily resolve this quhit from each entry */
+    double probs[MAX_QUHIT_HILBERT_ENTRIES];
+    memset(probs, 0, sizeof(probs));
     for (uint32_t e = 0; e < nz; e++) {
-        uint32_t v = decode_quhit_value(
-            eng->quhit_regs[r].entry_value[e], dim, promoted, quhit_idx);
-        probs[v] += eng->quhit_regs[r].amplitudes[e].real *
-                    eng->quhit_regs[r].amplitudes[e].real +
-                    eng->quhit_regs[r].amplitudes[e].imag *
-                    eng->quhit_regs[r].amplitudes[e].imag;
+        uint32_t v = lazy_resolve(&eng->quhit_regs[r].entries[e], quhit_idx);
+        double p = eng->quhit_regs[r].entries[e].amplitude.real *
+                   eng->quhit_regs[r].entries[e].amplitude.real +
+                   eng->quhit_regs[r].entries[e].amplitude.imag *
+                   eng->quhit_regs[r].entries[e].amplitude.imag;
+        if (v < MAX_QUHIT_HILBERT_ENTRIES) probs[v] += p;
     }
 
     /* Step 2: Born rule sampling */
@@ -4918,18 +5004,13 @@ uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_id
         if (cumul >= rand_val) { result = i; break; }
     }
 
-    /* Step 3: Collapse — keep only entries where TARGET quhit == result */
+    /* Step 3: Collapse — keep only entries where this quhit == result */
     uint32_t write_pos = 0;
     for (uint32_t e = 0; e < nz; e++) {
-        uint32_t v = decode_quhit_value(
-            eng->quhit_regs[r].entry_value[e], dim, promoted, quhit_idx);
+        uint32_t v = lazy_resolve(&eng->quhit_regs[r].entries[e], quhit_idx);
         if (v == result) {
-            if (write_pos != e) {
-                eng->quhit_regs[r].entry_value[write_pos] =
-                    eng->quhit_regs[r].entry_value[e];
-                eng->quhit_regs[r].amplitudes[write_pos] =
-                    eng->quhit_regs[r].amplitudes[e];
-            }
+            if (write_pos != e)
+                eng->quhit_regs[r].entries[write_pos] = eng->quhit_regs[r].entries[e];
             write_pos++;
         }
     }
@@ -4938,24 +5019,23 @@ uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_id
     /* Step 4: Renormalize */
     double norm = 0.0;
     for (uint32_t e = 0; e < write_pos; e++) {
-        norm += eng->quhit_regs[r].amplitudes[e].real *
-                eng->quhit_regs[r].amplitudes[e].real +
-                eng->quhit_regs[r].amplitudes[e].imag *
-                eng->quhit_regs[r].amplitudes[e].imag;
+        norm += eng->quhit_regs[r].entries[e].amplitude.real *
+                eng->quhit_regs[r].entries[e].amplitude.real +
+                eng->quhit_regs[r].entries[e].amplitude.imag *
+                eng->quhit_regs[r].entries[e].amplitude.imag;
     }
     if (norm > 0.0) {
         double scale = 1.0 / sqrt(norm);
         for (uint32_t e = 0; e < write_pos; e++) {
-            eng->quhit_regs[r].amplitudes[e].real *= scale;
-            eng->quhit_regs[r].amplitudes[e].imag *= scale;
+            eng->quhit_regs[r].entries[e].amplitude.real *= scale;
+            eng->quhit_regs[r].entries[e].amplitude.imag *= scale;
         }
     }
 
     /* Step 5: Check full collapse */
     if (eng->quhit_regs[r].num_nonzero == 1) {
         eng->quhit_regs[r].collapsed = 1;
-        eng->quhit_regs[r].collapse_outcome =
-            eng->quhit_regs[r].entry_value[0];
+        eng->quhit_regs[r].collapse_outcome = result;
     }
 
     return (uint64_t)result;
@@ -4968,151 +5048,36 @@ void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
     if (r < 0 || quhit_idx >= eng->quhit_regs[r].n_quhits) return;
     if (dim == 0) dim = eng->quhit_regs[r].dim;
 
-    int64_t promoted = eng->quhit_regs[r].promoted_quhit;
     uint32_t nz = eng->quhit_regs[r].num_nonzero;
     double omega = 2.0 * M_PI / dim;
     double inv_sqrt_d = 1.0 / sqrt((double)dim);
 
-    /* If no quhit is promoted yet and this quhit is bulk,
-     * promote it: expand entries from D to D² with tensor product encoding.
-     * entry_value goes from k (bulk) to j*D + k (promoted=j, bulk=k). */
-    if (promoted < 0 && nz <= dim) {
-        /* Promote: expand bulk entries into tensor product */
-        Complex old_amps[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t old_vals[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t old_nz = nz;
-        memcpy(old_amps, eng->quhit_regs[r].amplitudes, nz * sizeof(Complex));
-        memcpy(old_vals, eng->quhit_regs[r].entry_value, nz * sizeof(uint32_t));
+    /* DFT on quhit at Magic Pointer address quhit_idx.
+     * For each entry, lazily resolve the quhit's current value,
+     * then produce D new entries with DFT-rotated amplitudes.
+     * The entry self-describes the new state — no metadata needed. */
+    QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
+    uint32_t new_nz = 0;
 
-        /* Each old entry |k,...,k⟩ (where all quhits = k) becomes:
-         * DFT on target quhit: |k⟩ → (1/√D) Σ_j ω^{kj} |j⟩
-         * New entries: |(j, k,...,k)⟩ = encode(j, k) for each j */
-        Complex new_amps[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t new_vals[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t new_nz = 0;
-        memset(new_amps, 0, sizeof(new_amps));
+    for (uint32_t e = 0; e < nz; e++) {
+        QuhitBasisEntry *cur = &eng->quhit_regs[r].entries[e];
+        uint32_t v = lazy_resolve(cur, quhit_idx);
 
-        for (uint32_t e = 0; e < old_nz; e++) {
-            uint32_t k = old_vals[e];  /* Bulk value — all quhits had this */
-            Complex alpha = old_amps[e];
+        for (uint32_t j = 0; j < dim; j++) {
+            double phase = omega * v * j;
+            double cr = cos(phase) * inv_sqrt_d;
+            double ci = sin(phase) * inv_sqrt_d;
+            Complex a;
+            a.real = cur->amplitude.real * cr - cur->amplitude.imag * ci;
+            a.imag = cur->amplitude.real * ci + cur->amplitude.imag * cr;
 
-            for (uint32_t j = 0; j < dim && new_nz < MAX_QUHIT_HILBERT_ENTRIES; j++) {
-                double phase = omega * k * j;
-                double cr = cos(phase) * inv_sqrt_d;
-                double ci = sin(phase) * inv_sqrt_d;
-                Complex a;
-                a.real = alpha.real * cr - alpha.imag * ci;
-                a.imag = alpha.real * ci + alpha.imag * cr;
-
-                uint32_t new_val = encode_entry(j, k, dim);
-
-                /* Accumulate into existing entry or create new */
-                int found = -1;
-                for (uint32_t n = 0; n < new_nz; n++) {
-                    if (new_vals[n] == new_val) { found = (int)n; break; }
-                }
-                if (found >= 0) {
-                    new_amps[found].real += a.real;
-                    new_amps[found].imag += a.imag;
-                } else {
-                    new_vals[new_nz] = new_val;
-                    new_amps[new_nz] = a;
-                    new_nz++;
-                }
-            }
+            QuhitBasisEntry ne = entry_with_value(cur, quhit_idx, j, a);
+            accumulate_entry(new_entries, &new_nz, &ne);
         }
-
-        eng->quhit_regs[r].num_nonzero = new_nz;
-        memcpy(eng->quhit_regs[r].amplitudes, new_amps, new_nz * sizeof(Complex));
-        memcpy(eng->quhit_regs[r].entry_value, new_vals, new_nz * sizeof(uint32_t));
-        eng->quhit_regs[r].promoted_quhit = (int64_t)quhit_idx;
-        return;
     }
 
-    /* If this quhit is already the promoted one, DFT its factor in-place */
-    if (promoted >= 0 && (int64_t)quhit_idx == promoted) {
-        Complex new_amps[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t new_vals[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t new_nz = 0;
-        memset(new_amps, 0, sizeof(new_amps));
-
-        for (uint32_t e = 0; e < nz; e++) {
-            uint32_t v_p = eng->quhit_regs[r].entry_value[e] / dim;
-            uint32_t v_b = eng->quhit_regs[r].entry_value[e] % dim;
-            Complex alpha = eng->quhit_regs[r].amplitudes[e];
-
-            for (uint32_t j = 0; j < dim; j++) {
-                double phase = omega * v_p * j;
-                double cr = cos(phase) * inv_sqrt_d;
-                double ci = sin(phase) * inv_sqrt_d;
-                Complex a;
-                a.real = alpha.real * cr - alpha.imag * ci;
-                a.imag = alpha.real * ci + alpha.imag * cr;
-
-                uint32_t new_val = encode_entry(j, v_b, dim);
-                int found = -1;
-                for (uint32_t n = 0; n < new_nz; n++) {
-                    if (new_vals[n] == new_val) { found = (int)n; break; }
-                }
-                if (found >= 0) {
-                    new_amps[found].real += a.real;
-                    new_amps[found].imag += a.imag;
-                } else if (new_nz < MAX_QUHIT_HILBERT_ENTRIES) {
-                    new_vals[new_nz] = new_val;
-                    new_amps[new_nz] = a;
-                    new_nz++;
-                }
-            }
-        }
-
-        eng->quhit_regs[r].num_nonzero = new_nz;
-        memcpy(eng->quhit_regs[r].amplitudes, new_amps, new_nz * sizeof(Complex));
-        memcpy(eng->quhit_regs[r].entry_value, new_vals, new_nz * sizeof(uint32_t));
-        return;
-    }
-
-    /* Target is a bulk quhit while another is already promoted.
-     * Apply DFT to the bulk factor (v_bulk). */
-    if (promoted >= 0 && (int64_t)quhit_idx != promoted) {
-        Complex new_amps[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t new_vals[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t new_nz = 0;
-        memset(new_amps, 0, sizeof(new_amps));
-
-        for (uint32_t e = 0; e < nz; e++) {
-            uint32_t v_p = eng->quhit_regs[r].entry_value[e] / dim;
-            uint32_t v_b = eng->quhit_regs[r].entry_value[e] % dim;
-            Complex alpha = eng->quhit_regs[r].amplitudes[e];
-
-            for (uint32_t j = 0; j < dim; j++) {
-                double phase = omega * v_b * j;
-                double cr = cos(phase) * inv_sqrt_d;
-                double ci = sin(phase) * inv_sqrt_d;
-                Complex a;
-                a.real = alpha.real * cr - alpha.imag * ci;
-                a.imag = alpha.real * ci + alpha.imag * cr;
-
-                uint32_t new_val = encode_entry(v_p, j, dim);
-                int found = -1;
-                for (uint32_t n = 0; n < new_nz; n++) {
-                    if (new_vals[n] == new_val) { found = (int)n; break; }
-                }
-                if (found >= 0) {
-                    new_amps[found].real += a.real;
-                    new_amps[found].imag += a.imag;
-                } else if (new_nz < MAX_QUHIT_HILBERT_ENTRIES) {
-                    new_vals[new_nz] = new_val;
-                    new_amps[new_nz] = a;
-                    new_nz++;
-                }
-            }
-        }
-
-        eng->quhit_regs[r].num_nonzero = new_nz;
-        memcpy(eng->quhit_regs[r].amplitudes, new_amps, new_nz * sizeof(Complex));
-        memcpy(eng->quhit_regs[r].entry_value, new_vals, new_nz * sizeof(uint32_t));
-        return;
-    }
+    eng->quhit_regs[r].num_nonzero = new_nz;
+    memcpy(eng->quhit_regs[r].entries, new_entries, new_nz * sizeof(QuhitBasisEntry));
 }
 
 void apply_unitary_quhit(HexStateEngine *eng, uint64_t chunk_id,
@@ -5122,95 +5087,28 @@ void apply_unitary_quhit(HexStateEngine *eng, uint64_t chunk_id,
     if (r < 0 || quhit_idx >= eng->quhit_regs[r].n_quhits) return;
     if (dim == 0) dim = eng->quhit_regs[r].dim;
 
-    int64_t promoted = eng->quhit_regs[r].promoted_quhit;
     uint32_t nz = eng->quhit_regs[r].num_nonzero;
 
-    /* If bulk mode, promote the target quhit and apply U to its factor */
-    if (promoted < 0 && nz <= dim) {
-        Complex old_amps[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t old_vals[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t old_nz = nz;
-        memcpy(old_amps, eng->quhit_regs[r].amplitudes, nz * sizeof(Complex));
-        memcpy(old_vals, eng->quhit_regs[r].entry_value, nz * sizeof(uint32_t));
-
-        Complex new_amps[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t new_vals[MAX_QUHIT_HILBERT_ENTRIES];
-        uint32_t new_nz = 0;
-        memset(new_amps, 0, sizeof(new_amps));
-
-        for (uint32_t e = 0; e < old_nz; e++) {
-            uint32_t k = old_vals[e];
-            Complex alpha = old_amps[e];
-
-            for (uint32_t j = 0; j < dim && new_nz < MAX_QUHIT_HILBERT_ENTRIES; j++) {
-                Complex u_jk = U[j * dim + k];
-                Complex a;
-                a.real = alpha.real * u_jk.real - alpha.imag * u_jk.imag;
-                a.imag = alpha.real * u_jk.imag + alpha.imag * u_jk.real;
-
-                uint32_t new_val = encode_entry(j, k, dim);
-                int found = -1;
-                for (uint32_t n = 0; n < new_nz; n++) {
-                    if (new_vals[n] == new_val) { found = (int)n; break; }
-                }
-                if (found >= 0) {
-                    new_amps[found].real += a.real;
-                    new_amps[found].imag += a.imag;
-                } else {
-                    new_vals[new_nz] = new_val;
-                    new_amps[new_nz] = a;
-                    new_nz++;
-                }
-            }
-        }
-
-        eng->quhit_regs[r].num_nonzero = new_nz;
-        memcpy(eng->quhit_regs[r].amplitudes, new_amps, new_nz * sizeof(Complex));
-        memcpy(eng->quhit_regs[r].entry_value, new_vals, new_nz * sizeof(uint32_t));
-        eng->quhit_regs[r].promoted_quhit = (int64_t)quhit_idx;
-        return;
-    }
-
-    /* Already have a promoted quhit — apply U to the appropriate factor */
-    int is_promoted = (promoted >= 0 && (int64_t)quhit_idx == promoted);
-
-    Complex new_amps[MAX_QUHIT_HILBERT_ENTRIES];
-    uint32_t new_vals[MAX_QUHIT_HILBERT_ENTRIES];
+    QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
     uint32_t new_nz = 0;
-    memset(new_amps, 0, sizeof(new_amps));
 
     for (uint32_t e = 0; e < nz; e++) {
-        uint32_t v_p = eng->quhit_regs[r].entry_value[e] / dim;
-        uint32_t v_b = eng->quhit_regs[r].entry_value[e] % dim;
-        uint32_t k = is_promoted ? v_p : v_b;
-        Complex alpha = eng->quhit_regs[r].amplitudes[e];
+        QuhitBasisEntry *cur = &eng->quhit_regs[r].entries[e];
+        uint32_t k = lazy_resolve(cur, quhit_idx);
 
-        for (uint32_t j = 0; j < dim && new_nz < MAX_QUHIT_HILBERT_ENTRIES; j++) {
+        for (uint32_t j = 0; j < dim; j++) {
             Complex u_jk = U[j * dim + k];
             Complex a;
-            a.real = alpha.real * u_jk.real - alpha.imag * u_jk.imag;
-            a.imag = alpha.real * u_jk.imag + alpha.imag * u_jk.real;
+            a.real = cur->amplitude.real * u_jk.real - cur->amplitude.imag * u_jk.imag;
+            a.imag = cur->amplitude.real * u_jk.imag + cur->amplitude.imag * u_jk.real;
 
-            uint32_t new_val = is_promoted ? encode_entry(j, v_b, dim)
-                                           : encode_entry(v_p, j, dim);
-            int found = -1;
-            for (uint32_t n = 0; n < new_nz; n++) {
-                if (new_vals[n] == new_val) { found = (int)n; break; }
-            }
-            if (found >= 0) {
-                new_amps[found].real += a.real;
-                new_amps[found].imag += a.imag;
-            } else {
-                new_vals[new_nz] = new_val;
-                new_amps[new_nz] = a;
-                new_nz++;
-            }
+            QuhitBasisEntry ne = entry_with_value(cur, quhit_idx, j, a);
+            accumulate_entry(new_entries, &new_nz, &ne);
         }
     }
 
     eng->quhit_regs[r].num_nonzero = new_nz;
-    memcpy(eng->quhit_regs[r].amplitudes, new_amps, new_nz * sizeof(Complex));
-    memcpy(eng->quhit_regs[r].entry_value, new_vals, new_nz * sizeof(uint32_t));
+    memcpy(eng->quhit_regs[r].entries, new_entries, new_nz * sizeof(QuhitBasisEntry));
 }
 
 void braid_quhits(HexStateEngine *eng,
@@ -5218,22 +5116,16 @@ void braid_quhits(HexStateEngine *eng,
                   uint64_t chunk_b, uint64_t quhit_b,
                   uint32_t dim)
 {
-    /* For same-register quhits: create Bell/GHZ state in Hilbert space */
     int ra = find_quhit_reg(eng, chunk_a);
     int rb = find_quhit_reg(eng, chunk_b);
     if (ra < 0 || rb < 0) return;
     if (dim == 0) dim = eng->quhit_regs[ra].dim;
 
     if (ra == rb) {
-        /* Same register — full GHZ: |GHZ⟩ = (1/√D) Σ|k,k,...,k⟩ */
         entangle_all_quhits(eng, chunk_a);
     } else {
-        /* Cross-register: create matching GHZ states */
         entangle_all_quhits(eng, chunk_a);
         entangle_all_quhits(eng, chunk_b);
-        /* The cross-register entanglement is represented by both
-         * registers sharing the same GHZ structure — measuring one
-         * determines the other due to the symmetric amplitude pattern. */
     }
 }
 
@@ -5245,31 +5137,24 @@ void apply_cz_quhits(HexStateEngine *eng,
     int rb = find_quhit_reg(eng, chunk_b);
     if (ra < 0 || rb < 0) return;
 
-    /* CZ gate: applies phase ω^(v_a × v_b) to each amplitude.
-     * Uses tensor product decoding to get the value of each specific quhit. */
     uint32_t dim = eng->quhit_regs[ra].dim;
     double omega_cz = 2.0 * M_PI / dim;
-    int64_t promoted = eng->quhit_regs[ra].promoted_quhit;
 
     for (uint32_t e = 0; e < eng->quhit_regs[ra].num_nonzero; e++) {
-        uint32_t va = decode_quhit_value(
-            eng->quhit_regs[ra].entry_value[e], dim, promoted, quhit_a);
+        uint32_t va = lazy_resolve(&eng->quhit_regs[ra].entries[e], quhit_a);
         uint32_t vb;
         if (ra == rb) {
-            vb = decode_quhit_value(
-                eng->quhit_regs[ra].entry_value[e], dim, promoted, quhit_b);
+            vb = lazy_resolve(&eng->quhit_regs[ra].entries[e], quhit_b);
         } else {
-            vb = decode_quhit_value(
-                eng->quhit_regs[rb].entry_value[e % eng->quhit_regs[rb].num_nonzero],
-                eng->quhit_regs[rb].dim,
-                eng->quhit_regs[rb].promoted_quhit, quhit_b);
+            uint32_t eb = e % eng->quhit_regs[rb].num_nonzero;
+            vb = lazy_resolve(&eng->quhit_regs[rb].entries[eb], quhit_b);
         }
 
         double phase = omega_cz * va * vb;
         double cr = cos(phase), ci = sin(phase);
-        Complex a = eng->quhit_regs[ra].amplitudes[e];
-        eng->quhit_regs[ra].amplitudes[e].real = a.real * cr - a.imag * ci;
-        eng->quhit_regs[ra].amplitudes[e].imag = a.real * ci + a.imag * cr;
+        Complex a = eng->quhit_regs[ra].entries[e].amplitude;
+        eng->quhit_regs[ra].entries[e].amplitude.real = a.real * cr - a.imag * ci;
+        eng->quhit_regs[ra].entries[e].amplitude.imag = a.real * ci + a.imag * cr;
     }
 }
 
@@ -5283,9 +5168,7 @@ HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
     if (r < 0 || quhit_idx >= eng->quhit_regs[r].n_quhits) return snap;
 
     uint32_t dim = eng->quhit_regs[r].dim;
-    int64_t promoted = eng->quhit_regs[r].promoted_quhit;
 
-    /* Read the Hilbert space contents */
     snap.num_members = eng->quhit_regs[r].n_quhits;
     snap.num_entries = eng->quhit_regs[r].num_nonzero;
     snap.dim = dim;
@@ -5293,24 +5176,21 @@ HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
     snap.is_entangled = (eng->quhit_regs[r].num_nonzero > 1) ? 1 : 0;
     snap.total_probability = 0.0;
 
-    /* Fill entries and marginal probabilities using tensor product decoding */
+    /* Lazily resolve this quhit from each self-describing entry */
     for (uint32_t e = 0; e < eng->quhit_regs[r].num_nonzero &&
                           e < MAX_INSPECT_ENTRIES; e++) {
-        snap.entries[e].amp_real = eng->quhit_regs[r].amplitudes[e].real;
-        snap.entries[e].amp_imag = eng->quhit_regs[r].amplitudes[e].imag;
-        double p = eng->quhit_regs[r].amplitudes[e].real *
-                   eng->quhit_regs[r].amplitudes[e].real +
-                   eng->quhit_regs[r].amplitudes[e].imag *
-                   eng->quhit_regs[r].amplitudes[e].imag;
+        QuhitBasisEntry *ent = &eng->quhit_regs[r].entries[e];
+        snap.entries[e].amp_real = ent->amplitude.real;
+        snap.entries[e].amp_imag = ent->amplitude.imag;
+        double p = ent->amplitude.real * ent->amplitude.real +
+                   ent->amplitude.imag * ent->amplitude.imag;
         snap.entries[e].probability = p;
         snap.total_probability += p;
 
-        /* Decode the quhit-specific value for marginal probabilities */
-        uint32_t v = decode_quhit_value(
-            eng->quhit_regs[r].entry_value[e], dim, promoted, quhit_idx);
+        uint32_t v = lazy_resolve(ent, quhit_idx);
         if (v < NUM_BASIS_STATES) snap.marginal_probs[v] += p;
     }
 
-    snap.purity = 1.0;  /* Pure state */
+    snap.purity = 1.0;
     return snap;
 }
