@@ -4076,10 +4076,10 @@ MerminResult mermin_test(HexStateEngine *eng, uint32_t n_parties,
 
     MerminResult r = {0};
     r.n_parties = n_parties;
-    r.dim = NUM_BASIS_STATES;
+    r.dim = 6;  /* Engine native D=6, not NUM_BASIS_STATES (which is 2048 for arrays) */
     r.n_shots = n_shots;
-    r.classical_bound = 1.0 / NUM_BASIS_STATES;
-    uint32_t dim = NUM_BASIS_STATES;
+    r.classical_bound = 1.0 / 6;
+    uint32_t dim = 6;
 
     uint64_t quhits = 100000000000000ULL;  /* 100T per register */
 
