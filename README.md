@@ -244,8 +244,7 @@ When you apply a gate to a specific quhit (e.g., `apply_dft_quhit(eng, 0, 42, 6)
                                       basis state of quhit 42)
 ```
 
-Up to 3 quhits can be individually promoted per entry, giving a maximum of D⁴ = 1296 entries (D for bulk × D³ for 3 promoted quhits).
-
+**Promotion is lazy and conceptually infinite.** You never need to promote all quhits — only the ones you individually gate. The other 99,999,999,999,999 quhits remain lazily resolved from `bulk_value` at zero cost. Each promotion multiplies the entry count by D, so promoting k quhits gives D^(k+1) entries. The compile-time constant `MAX_ADDR_PER_ENTRY` (currently 3, giving D⁴=1296 entries) is a tunable knob — increase it to promote more quhits simultaneously. The architecture itself imposes no limit: lazy resolution means any quhit can be promoted on demand, and the rest stay derived.
 ---
 
 ### Combining Both Modes
