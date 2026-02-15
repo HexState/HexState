@@ -4970,13 +4970,15 @@ uint64_t resolve_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_id
 
 /* Lazily resolve a quhit's value from a self-describing entry.
  * Scans the entry's address map; returns the individual value if found,
- * otherwise returns bulk_value. No metadata needed — the entry IS the hardware. */
-static inline uint32_t lazy_resolve(const QuhitBasisEntry *e, uint64_t quhit_idx)
+ * otherwise returns bulk_value (rule=0) or quhit_idx % dim (rule=1 cyclic). */
+static inline uint32_t lazy_resolve(const QuhitBasisEntry *e, uint64_t quhit_idx,
+                                    uint8_t bulk_rule, uint32_t dim)
 {
     for (uint8_t i = 0; i < e->num_addr; i++) {
         if (e->addr[i].quhit_idx == quhit_idx)
             return e->addr[i].value;
     }
+    if (bulk_rule == 1) return (uint32_t)(quhit_idx % dim);
     return e->bulk_value;
 }
 
@@ -5049,14 +5051,14 @@ uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_id
 
     /* If already fully collapsed, lazily resolve from the surviving entry */
     if (eng->quhit_regs[r].collapsed) {
-        return (uint64_t)lazy_resolve(&eng->quhit_regs[r].entries[0], quhit_idx);
+        return (uint64_t)lazy_resolve(&eng->quhit_regs[r].entries[0], quhit_idx, eng->quhit_regs[r].bulk_rule, eng->quhit_regs[r].dim);
     }
 
     /* Step 1: Compute marginal P(v) — lazily resolve this quhit from each entry */
     double probs[MAX_QUHIT_HILBERT_ENTRIES];
     memset(probs, 0, sizeof(probs));
     for (uint32_t e = 0; e < nz; e++) {
-        uint32_t v = lazy_resolve(&eng->quhit_regs[r].entries[e], quhit_idx);
+        uint32_t v = lazy_resolve(&eng->quhit_regs[r].entries[e], quhit_idx, eng->quhit_regs[r].bulk_rule, eng->quhit_regs[r].dim);
         double p = eng->quhit_regs[r].entries[e].amplitude.real *
                    eng->quhit_regs[r].entries[e].amplitude.real +
                    eng->quhit_regs[r].entries[e].amplitude.imag *
@@ -5076,7 +5078,7 @@ uint64_t measure_quhit(HexStateEngine *eng, uint64_t chunk_id, uint64_t quhit_id
     /* Step 3: Collapse — keep only entries where this quhit == result */
     uint32_t write_pos = 0;
     for (uint32_t e = 0; e < nz; e++) {
-        uint32_t v = lazy_resolve(&eng->quhit_regs[r].entries[e], quhit_idx);
+        uint32_t v = lazy_resolve(&eng->quhit_regs[r].entries[e], quhit_idx, eng->quhit_regs[r].bulk_rule, eng->quhit_regs[r].dim);
         if (v == result) {
             if (write_pos != e)
                 eng->quhit_regs[r].entries[write_pos] = eng->quhit_regs[r].entries[e];
@@ -5130,7 +5132,7 @@ void apply_dft_quhit(HexStateEngine *eng, uint64_t chunk_id,
 
     for (uint32_t e = 0; e < nz; e++) {
         QuhitBasisEntry *cur = &eng->quhit_regs[r].entries[e];
-        uint32_t v = lazy_resolve(cur, quhit_idx);
+        uint32_t v = lazy_resolve(cur, quhit_idx, eng->quhit_regs[r].bulk_rule, dim);
 
         for (uint32_t j = 0; j < dim; j++) {
             double phase = omega * v * j;
@@ -5163,7 +5165,7 @@ void apply_unitary_quhit(HexStateEngine *eng, uint64_t chunk_id,
 
     for (uint32_t e = 0; e < nz; e++) {
         QuhitBasisEntry *cur = &eng->quhit_regs[r].entries[e];
-        uint32_t k = lazy_resolve(cur, quhit_idx);
+        uint32_t k = lazy_resolve(cur, quhit_idx, eng->quhit_regs[r].bulk_rule, dim);
 
         for (uint32_t j = 0; j < dim; j++) {
             Complex u_jk = U[j * dim + k];
@@ -5210,13 +5212,13 @@ void apply_cz_quhits(HexStateEngine *eng,
     double omega_cz = 2.0 * M_PI / dim;
 
     for (uint32_t e = 0; e < eng->quhit_regs[ra].num_nonzero; e++) {
-        uint32_t va = lazy_resolve(&eng->quhit_regs[ra].entries[e], quhit_a);
+        uint32_t va = lazy_resolve(&eng->quhit_regs[ra].entries[e], quhit_a, eng->quhit_regs[ra].bulk_rule, eng->quhit_regs[ra].dim);
         uint32_t vb;
         if (ra == rb) {
-            vb = lazy_resolve(&eng->quhit_regs[ra].entries[e], quhit_b);
+            vb = lazy_resolve(&eng->quhit_regs[ra].entries[e], quhit_b, eng->quhit_regs[ra].bulk_rule, eng->quhit_regs[ra].dim);
         } else {
             uint32_t eb = e % eng->quhit_regs[rb].num_nonzero;
-            vb = lazy_resolve(&eng->quhit_regs[rb].entries[eb], quhit_b);
+            vb = lazy_resolve(&eng->quhit_regs[rb].entries[eb], quhit_b, eng->quhit_regs[rb].bulk_rule, eng->quhit_regs[rb].dim);
         }
 
         double phase = omega_cz * va * vb;
@@ -5225,6 +5227,46 @@ void apply_cz_quhits(HexStateEngine *eng,
         eng->quhit_regs[ra].entries[e].amplitude.real = a.real * cr - a.imag * ci;
         eng->quhit_regs[ra].entries[e].amplitude.imag = a.real * ci + a.imag * cr;
     }
+}
+
+/* ── SUM gate (generalized CNOT): |a,b⟩ → |a, (a+b) mod D⟩ ──
+ * This is the proper entangling gate for D-dimensional systems.
+ * Unlike CZ (which only adds phase), SUM creates value correlations:
+ * DFT(control) + SUM(control→target) = Bell pair (1/√D)Σ|k,(k+b)%D⟩
+ * DFT + SUM chain = GHZ state  */
+void apply_sum_quhits(HexStateEngine *eng,
+                      uint64_t chunk_ctrl, uint64_t quhit_ctrl,
+                      uint64_t chunk_tgt,  uint64_t quhit_tgt)
+{
+    int rc = find_quhit_reg(eng, chunk_ctrl);
+    int rt = find_quhit_reg(eng, chunk_tgt);
+    if (rc < 0 || rt < 0) return;
+    if (rc != rt) {
+        /* Cross-register SUM not yet supported */
+        return;
+    }
+
+    uint32_t dim = eng->quhit_regs[rc].dim;
+    uint32_t nz = eng->quhit_regs[rc].num_nonzero;
+
+    QuhitBasisEntry new_entries[MAX_QUHIT_HILBERT_ENTRIES];
+    uint32_t new_nz = 0;
+
+    for (uint32_t e = 0; e < nz; e++) {
+        QuhitBasisEntry *cur = &eng->quhit_regs[rc].entries[e];
+        uint32_t va = lazy_resolve(cur, quhit_ctrl, eng->quhit_regs[rc].bulk_rule, dim);
+        uint32_t vb = lazy_resolve(cur, quhit_tgt, eng->quhit_regs[rc].bulk_rule, dim);
+        uint32_t new_val = (va + vb) % dim;
+
+        /* Create entry with target quhit's value changed to (a+b)%D */
+        QuhitBasisEntry ne = entry_with_value(cur, quhit_tgt, new_val, cur->amplitude);
+        /* Also ensure control is explicitly in addr (it may have been bulk) */
+        ne = entry_with_value(&ne, quhit_ctrl, va, ne.amplitude);
+        accumulate_entry(new_entries, &new_nz, &ne);
+    }
+
+    eng->quhit_regs[rc].num_nonzero = new_nz;
+    memcpy(eng->quhit_regs[rc].entries, new_entries, new_nz * sizeof(QuhitBasisEntry));
 }
 
 HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
@@ -5256,7 +5298,7 @@ HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
         snap.entries[e].probability = p;
         snap.total_probability += p;
 
-        uint32_t v = lazy_resolve(ent, quhit_idx);
+        uint32_t v = lazy_resolve(ent, quhit_idx, eng->quhit_regs[r].bulk_rule, eng->quhit_regs[r].dim);
         if (v < NUM_BASIS_STATES) snap.marginal_probs[v] += p;
     }
 
