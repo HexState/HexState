@@ -258,8 +258,16 @@ typedef struct HexStateEngine_s {
      * Each register IS a Hilbert space. No Chunk structs per quhit.
      * Magic Pointer for quhit k = (MAGIC_TAG << 48) | (chunk_id << 16) | k
      * The quantum state is stored directly as sparse amplitudes.
-     * Operations (measure, DFT, braid) work on the amplitudes. */
-#define MAX_QUHIT_HILBERT_ENTRIES 36  /* D² max for 2-member non-GHZ states */
+     * Operations (measure, DFT, braid) work on the amplitudes.
+     *
+     * Tensor product encoding:
+     *   promoted_quhit == -1: "bulk" mode — entry_value = k means ALL quhits = k
+     *   promoted_quhit >= 0:  entry_value = v_promoted * D + v_bulk
+     *     v_promoted = value of the individually-addressed quhit
+     *     v_bulk     = value shared by all other quhits
+     *   This lets one quhit be individually operated (DFT, measure)
+     *   while the rest remain in GHZ bulk — resolving through the same space. */
+#define MAX_QUHIT_HILBERT_ENTRIES 36  /* D² — full tensor product for 1 promoted + bulk */
     struct {
         uint64_t  chunk_id;                   /* Parent chunk ID */
         uint64_t  n_quhits;                   /* Number of Magic Pointer quhits */
@@ -271,6 +279,8 @@ typedef struct HexStateEngine_s {
         uint8_t   collapsed;                  /* 1 = measurement has occurred */
         uint32_t  collapse_outcome;           /* Determined value (all members) */
         uint64_t  magic_base;                 /* Base Magic Pointer for this register */
+        /* ─── Per-Quhit Tensor Product Tracking ─── */
+        int64_t   promoted_quhit;             /* -1 = all bulk, ≥0 = this quhit is individually tracked */
     } quhit_regs[MAX_QUHIT_REGISTERS];
     uint32_t        num_quhit_regs;
 } HexStateEngine;
