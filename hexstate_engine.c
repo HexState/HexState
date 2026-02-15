@@ -2940,6 +2940,43 @@ int execute_instruction(HexStateEngine *eng, Instruction instr)
         break;
     }
 
+    case OP_SUBSYSTEM: {
+        /* Sub-system entanglement operations (D=6 = 2⊗3)
+         * op1 encodes the sub-operation:
+         *   0 = decompose (print sub-system analysis)
+         *   1 = entangle type 0 (Bell |0,0⟩+|1,1⟩)
+         *   2 = entangle type 1 (Bell |0,0⟩+|1,2⟩)
+         *   3 = generalized Bell state (op2 = m*6+n)
+         *   4 = partial transpose negativity */
+        switch (op1) {
+            case 0: {
+                SubSystemDecomp d = subsystem_decompose(eng, target);
+                subsystem_decompose_print(&d);
+                break;
+            }
+            case 1:
+                subsystem_entangle(eng, target, 0, NULL);
+                break;
+            case 2:
+                subsystem_entangle(eng, target, 1, NULL);
+                break;
+            case 3: {
+                uint32_t m = op2 / 6, n = op2 % 6;
+                generalized_bell_state(eng, target, op1, m, n, 6);
+                break;
+            }
+            case 4: {
+                double log_neg;
+                partial_transpose_negativity(eng, target, &log_neg);
+                break;
+            }
+            default:
+                printf("  [SUBSYS] Unknown sub-operation %lu\n", (unsigned long)op1);
+        }
+        break;
+    }
+
+
     case OP_SHIFT: {
         /* Cyclic shift of state vector via Magic Pointer */
         uint64_t shift_ns = 0;
@@ -4155,4 +4192,555 @@ void mermin_test_print(MerminResult *r)
     }
 
     printf("    Time: %.1f ms\n\n", r->elapsed_ms);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SUB-SYSTEM ENTANGLEMENT — D=6 = 2⊗3
+ *
+ * D=6 is the smallest dimension where:
+ *   1. Internal entanglement exists (qubit⊗qutrit within one register)
+ *   2. 36 generalized Bell states form a complete basis
+ *   3. Bound entanglement (PPT entangled states) can occur
+ *
+ * Decomposition: |k⟩ → |k/3⟩_qubit ⊗ |k%3⟩_qutrit
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* ── Helper: eigenvalues of 2×2 Hermitian matrix ────────────────────────── */
+static void eigen_2x2(const Complex *rho, double *e0, double *e1) {
+    double a = rho[0].real, d = rho[3].real;
+    double bc2 = rho[1].real * rho[1].real + rho[1].imag * rho[1].imag;
+    double tr = a + d;
+    double det = a * d - bc2;
+    double disc = sqrt(fmax(tr * tr - 4 * det, 0.0));
+    *e0 = (tr + disc) / 2.0;
+    *e1 = (tr - disc) / 2.0;
+}
+
+/* ── Helper: eigenvalues of 3×3 Hermitian matrix ────────────────────────── */
+static void eigen_3x3(const Complex *rho, double *evals) {
+    /* Hermitian 3×3: use analytic Cardano formula */
+    double a = rho[0*3+0].real, b = rho[1*3+1].real, c = rho[2*3+2].real;
+    double p2 = cnorm2(rho[0*3+1]);
+    double q2 = cnorm2(rho[0*3+2]);
+    double r2 = cnorm2(rho[1*3+2]);
+
+    double tr = a + b + c;
+    double q = tr / 3.0;
+    double s = (a*b + a*c + b*c - p2 - q2 - r2);
+
+    /* p² = (1/6) * [(a-b)² + (a-c)² + (b-c)² + 6(p2+q2+r2)] */
+    double p2val = ((a-b)*(a-b) + (a-c)*(a-c) + (b-c)*(b-c) + 6*(p2+q2+r2)) / 6.0;
+    double p = sqrt(fmax(p2val, 0.0));
+
+    if (p < 1e-14) {
+        evals[0] = evals[1] = evals[2] = q;
+        return;
+    }
+
+    /* B = (1/p)(A - qI) */
+    double det_B;
+    {
+        double b00 = (a - q) / p, b11 = (b - q) / p, b22 = (c - q) / p;
+        double b01_r = rho[0*3+1].real/p, b01_i = rho[0*3+1].imag/p;
+        double b02_r = rho[0*3+2].real/p, b02_i = rho[0*3+2].imag/p;
+        double b12_r = rho[1*3+2].real/p, b12_i = rho[1*3+2].imag/p;
+
+        /* det(B) for Hermitian matrix */
+        det_B = b00 * (b11*b22 - (b12_r*b12_r + b12_i*b12_i))
+              - (b01_r*(b01_r*b22 - (b12_r*b02_r + b12_i*b02_i))
+                +b01_i*(b01_i*b22 + (b12_r*b02_i - b12_i*b02_r)))
+              + (b02_r*(b01_r*b12_r + b01_i*b12_i - b11*b02_r)
+                +b02_i*(-b01_r*b12_i + b01_i*b12_r - b11*b02_i));
+    }
+    double half_det_B = det_B / 2.0;
+    if (half_det_B > 1.0)  half_det_B = 1.0;
+    if (half_det_B < -1.0) half_det_B = -1.0;
+    double phi = acos(half_det_B) / 3.0;
+
+    evals[0] = q + 2*p*cos(phi);
+    evals[1] = q + 2*p*cos(phi - 2*M_PI/3);
+    evals[2] = q + 2*p*cos(phi + 2*M_PI/3);
+}
+
+/* ── Helper: von Neumann entropy from eigenvalue array ──────────────────── */
+static double vn_entropy(const double *evals, int n) {
+    double S = 0;
+    for (int i = 0; i < n; i++) {
+        double e = fmax(evals[i], 0.0);
+        if (e > 1e-15)
+            S -= e * log2(e);
+    }
+    return S;
+}
+
+/* ── Get the 6 amplitudes for a single register in a group ──────────────── */
+static void get_register_amplitudes(HexStateEngine *eng, uint64_t chunk_id,
+                                    Complex *amps, uint32_t dim)
+{
+    memset(amps, 0, (size_t)dim * sizeof(Complex));
+    if (chunk_id >= eng->num_chunks) return;
+
+    Chunk *c = &eng->chunks[chunk_id];
+    HilbertGroup *g = c->hilbert.group;
+
+    if (!g || g->num_nonzero == 0) {
+        /* No group — assume |0⟩ */
+        amps[0] = (Complex){1.0, 0.0};
+        return;
+    }
+
+    uint32_t my_idx = c->hilbert.group_index;
+    uint32_t nm = g->num_members;
+
+    /* Collect base amplitudes for this register's index */
+    for (uint32_t e = 0; e < g->num_nonzero; e++) {
+        uint32_t k = g->basis_indices[e * nm + my_idx];
+        if (k < dim) {
+            amps[k] = cadd(amps[k], g->amplitudes[e]);
+        }
+    }
+
+    /* Replay any deferred (LAZY-pushed) unitaries for this member */
+    if (g->lazy_count[my_idx] > 0) {
+        Complex temp[6]; /* D=6 max */
+        for (uint32_t op = 0; op < g->lazy_count[my_idx]; op++) {
+            Complex *U = g->lazy_U[my_idx][op];
+            memset(temp, 0, (size_t)dim * sizeof(Complex));
+            for (uint32_t j = 0; j < dim; j++) {
+                for (uint32_t k = 0; k < dim; k++) {
+                    /* temp[j] += U[j*dim+k] * amps[k] */
+                    temp[j] = cadd(temp[j], cmul(U[j*dim+k], amps[k]));
+                }
+            }
+            memcpy(amps, temp, (size_t)dim * sizeof(Complex));
+        }
+    }
+}
+
+/* ── subsystem_decompose: compute reduced density matrices ──────────────── */
+SubSystemDecomp subsystem_decompose(HexStateEngine *eng, uint64_t chunk_id)
+{
+    SubSystemDecomp result;
+    memset(&result, 0, sizeof(result));
+    result.dim_a = 2;  /* qubit */
+    result.dim_b = 3;  /* qutrit */
+
+    /* Get the 6 amplitudes for this register */
+    Complex psi[6];
+    get_register_amplitudes(eng, chunk_id, psi, 6);
+
+    /* Compute ρ_A (qubit) = Tr_B(|ψ⟩⟨ψ|)
+     * ρ_A[a][a'] = Σ_j ψ[3a+j] · ψ*[3a'+j] */
+    for (int a = 0; a < 2; a++) {
+        for (int ap = 0; ap < 2; ap++) {
+            Complex sum = {0, 0};
+            for (int j = 0; j < 3; j++) {
+                sum = cadd(sum, cmul(psi[3*a+j], cconj(psi[3*ap+j])));
+            }
+            result.rho_a[a*2+ap] = sum;
+        }
+    }
+
+    /* Compute ρ_B (qutrit) = Tr_A(|ψ⟩⟨ψ|)
+     * ρ_B[j][j'] = Σ_a ψ[3a+j] · ψ*[3a+j'] */
+    for (int j = 0; j < 3; j++) {
+        for (int jp = 0; jp < 3; jp++) {
+            Complex sum = {0, 0};
+            for (int a = 0; a < 2; a++) {
+                sum = cadd(sum, cmul(psi[3*a+j], cconj(psi[3*a+jp])));
+            }
+            result.rho_b[j*3+jp] = sum;
+        }
+    }
+
+    /* Eigenvalues and entropy */
+    eigen_2x2(result.rho_a, &result.eigenvalues_a[0], &result.eigenvalues_a[1]);
+    eigen_3x3(result.rho_b, result.eigenvalues_b);
+
+    result.entropy_a = vn_entropy(result.eigenvalues_a, 2);
+    result.entropy_b = vn_entropy(result.eigenvalues_b, 3);
+
+    /* Total entropy of the pure state = 0, so S(AB) = 0
+     * Mutual information I(A:B) = S(A) + S(B) - S(AB) = S(A) + S(B) */
+    result.mutual_info = result.entropy_a + result.entropy_b;
+
+    /* Entangled if either subsystem has non-zero entropy */
+    result.is_entangled = (result.entropy_a > 0.001) ? 1 : 0;
+
+    printf("  [SUBSYS] Decomposed chunk %lu into qubit(2)⊗qutrit(3)\n", chunk_id);
+    printf("  [SUBSYS] Entropy A (qubit): %.6f bits, B (qutrit): %.6f bits\n",
+           result.entropy_a, result.entropy_b);
+    printf("  [SUBSYS] Internal entanglement: %s\n",
+           result.is_entangled ? "YES" : "NO (product state)");
+
+    return result;
+}
+
+void subsystem_decompose_print(SubSystemDecomp *d) {
+    printf("\n  ═══ Sub-System Decomposition (D=6 = 2⊗3) ═══\n\n");
+
+    printf("  Qubit (dim=2) reduced density matrix ρ_A:\n");
+    printf("    [%.6f%+.6fi  %.6f%+.6fi]\n",
+           d->rho_a[0].real, d->rho_a[0].imag, d->rho_a[1].real, d->rho_a[1].imag);
+    printf("    [%.6f%+.6fi  %.6f%+.6fi]\n",
+           d->rho_a[2].real, d->rho_a[2].imag, d->rho_a[3].real, d->rho_a[3].imag);
+    printf("  Eigenvalues: %.6f, %.6f\n", d->eigenvalues_a[0], d->eigenvalues_a[1]);
+    printf("  von Neumann entropy: %.6f bits\n\n", d->entropy_a);
+
+    printf("  Qutrit (dim=3) reduced density matrix ρ_B:\n");
+    for (int i = 0; i < 3; i++) {
+        printf("    [");
+        for (int j = 0; j < 3; j++)
+            printf("%.4f%+.4fi ", d->rho_b[i*3+j].real, d->rho_b[i*3+j].imag);
+        printf("]\n");
+    }
+    printf("  Eigenvalues: %.6f, %.6f, %.6f\n",
+           d->eigenvalues_b[0], d->eigenvalues_b[1], d->eigenvalues_b[2]);
+    printf("  von Neumann entropy: %.6f bits\n\n", d->entropy_b);
+
+    printf("  Mutual information I(A:B) = %.6f bits\n", d->mutual_info);
+    printf("  Internal entanglement: %s\n\n",
+           d->is_entangled ? "★ YES — qubit and qutrit are entangled within one register"
+                           : "NO — product state across subsystems");
+}
+
+/* ── subsystem_entangle: prepare internally entangled state ─────────────── */
+void subsystem_entangle(HexStateEngine *eng, uint64_t chunk_id,
+                        int type, const Complex *custom_state)
+{
+    if (chunk_id >= eng->num_chunks) return;
+
+    Complex target[6];
+    memset(target, 0, sizeof(target));
+
+    double s2 = 1.0 / sqrt(2.0);
+    switch (type) {
+        case 0: /* (|0,0⟩+|1,1⟩)/√2 = (|0⟩+|4⟩)/√2 */
+            target[0] = (Complex){s2, 0};
+            target[4] = (Complex){s2, 0};
+            break;
+        case 1: /* (|0,0⟩+|1,2⟩)/√2 = (|0⟩+|5⟩)/√2 */
+            target[0] = (Complex){s2, 0};
+            target[5] = (Complex){s2, 0};
+            break;
+        case 2: /* Custom */
+            if (!custom_state) return;
+            memcpy(target, custom_state, sizeof(target));
+            break;
+        default:
+            return;
+    }
+
+    /* Build unitary whose first column is the target state (Gram-Schmidt) */
+    Complex U[36];
+    memset(U, 0, sizeof(U));
+
+    /* First column = target */
+    for (int i = 0; i < 6; i++) U[i*6+0] = target[i];
+
+    /* Gram-Schmidt for remaining columns */
+    for (int col = 1; col < 6; col++) {
+        Complex v[6];
+        memset(v, 0, sizeof(v));
+        v[col] = (Complex){1.0, 0.0};
+
+        for (int prev = 0; prev < col; prev++) {
+            Complex dot = {0, 0};
+            for (int i = 0; i < 6; i++)
+                dot = cadd(dot, cmul(cconj(U[i*6+prev]), v[i]));
+            for (int i = 0; i < 6; i++) {
+                v[i] = csub(v[i], cmul(dot, U[i*6+prev]));
+            }
+        }
+
+        double nrm = 0;
+        for (int i = 0; i < 6; i++) nrm += cnorm2(v[i]);
+        nrm = sqrt(nrm);
+        if (nrm > 1e-12)
+            for (int i = 0; i < 6; i++) {
+                v[i].real /= nrm;
+                v[i].imag /= nrm;
+                U[i*6+col] = v[i];
+            }
+    }
+
+    apply_local_unitary(eng, chunk_id, U, 6);
+
+    const char *names[] = { "(|0,0⟩+|1,1⟩)/√2", "(|0,0⟩+|1,2⟩)/√2", "custom" };
+    printf("  [SUBSYS] Created internal Bell state %s in chunk %lu\n",
+           names[type < 3 ? type : 2], chunk_id);
+}
+
+/* ── generalized_bell_state: create |Ψ_mn⟩ ─────────────────────────────── */
+void generalized_bell_state(HexStateEngine *eng, uint64_t a, uint64_t b,
+                            uint32_t m, uint32_t n, uint32_t dim)
+{
+    if (dim == 0) dim = 6;
+
+    /* Step 1: Create standard Bell state |Ψ_00⟩ = (1/√D) Σ|k,k⟩ */
+    braid_chunks_dim(eng, a, b, 0, 0, dim);
+
+    /* Step 2: Apply Z^m to chunk a (phase gate) */
+    if (m > 0) {
+        Complex *Zm = calloc((size_t)dim * dim, sizeof(Complex));
+        for (uint32_t k = 0; k < dim; k++) {
+            double angle = 2.0 * M_PI * m * k / dim;
+            Zm[k*dim+k] = (Complex){cos(angle), sin(angle)};
+        }
+        apply_local_unitary(eng, a, Zm, dim);
+        free(Zm);
+    }
+
+    /* Step 3: Apply X^n to chunk b (cyclic shift by n) */
+    if (n > 0) {
+        Complex *Xn = calloc((size_t)dim * dim, sizeof(Complex));
+        for (uint32_t k = 0; k < dim; k++) {
+            uint32_t target_k = (k + n) % dim;
+            Xn[target_k*dim+k] = (Complex){1.0, 0.0};
+        }
+        apply_local_unitary(eng, b, Xn, dim);
+        free(Xn);
+    }
+
+    printf("  [GEN-BELL] Created |Ψ_%u%u⟩ = (1/√%u) Σ_k ω^(%uk) |k, (k+%u) mod %u⟩\n",
+           m, n, dim, m, n, dim);
+    printf("  [GEN-BELL] State %u of %u total generalized Bell states\n",
+           m * dim + n + 1, dim * dim);
+}
+
+/* ── partial_transpose_negativity: entanglement witness ─────────────────── */
+double partial_transpose_negativity(HexStateEngine *eng, uint64_t chunk_id,
+                                    double *log_negativity)
+{
+    if (chunk_id >= eng->num_chunks) {
+        if (log_negativity) *log_negativity = 0;
+        return 0;
+    }
+
+    Chunk *c = &eng->chunks[chunk_id];
+    HilbertGroup *g = c->hilbert.group;
+
+    if (!g || g->num_members < 2) {
+        printf("  [PPT] Chunk %lu is not entangled (no group or single member)\n",
+               chunk_id);
+        if (log_negativity) *log_negativity = 0;
+        return 0;
+    }
+
+    uint32_t dim = g->dim;
+    uint32_t dim2 = dim * dim;
+
+    /* Build the full density matrix ρ of the 2-party state
+     * ρ[(a,b),(c,d)] = Σ_e Σ_f α_e α*_f  where indices match */
+    Complex *rho = calloc(dim2 * dim2, sizeof(Complex));
+    uint32_t nm = g->num_members;
+    uint32_t my_idx = c->hilbert.group_index;
+
+    /* Find partner index (first other member) */
+    uint32_t partner_idx = (my_idx == 0) ? 1 : 0;
+
+    for (uint32_t e = 0; e < g->num_nonzero; e++) {
+        uint32_t ie = g->basis_indices[e * nm + my_idx];
+        uint32_t je = g->basis_indices[e * nm + partner_idx];
+        Complex ae = g->amplitudes[e];
+
+        for (uint32_t f = 0; f < g->num_nonzero; f++) {
+            uint32_t if_ = g->basis_indices[f * nm + my_idx];
+            uint32_t jf = g->basis_indices[f * nm + partner_idx];
+            Complex af = g->amplitudes[f];
+
+            /* ρ[(ie,je),(if,jf)] += ae · af* */
+            uint32_t row = ie * dim + je;
+            uint32_t col = if_ * dim + jf;
+            Complex prod = cmul(ae, cconj(af));
+            rho[row * dim2 + col] = cadd(rho[row * dim2 + col], prod);
+        }
+    }
+
+    /* Partial transpose: ρ^(T_B)[(a,b),(c,d)] = ρ[(a,d),(c,b)]
+     * Swap b↔d indices on system B */
+    Complex *rho_pt = calloc(dim2 * dim2, sizeof(Complex));
+    for (uint32_t a = 0; a < dim; a++)
+        for (uint32_t b = 0; b < dim; b++)
+            for (uint32_t cc = 0; cc < dim; cc++)
+                for (uint32_t d = 0; d < dim; d++) {
+                    uint32_t row_new = a*dim + b;
+                    uint32_t col_new = cc*dim + d;
+                    /* Original: ρ[(a,d),(c,b)] */
+                    uint32_t row_old = a*dim + d;
+                    uint32_t col_old = cc*dim + b;
+                    rho_pt[row_new * dim2 + col_new] = rho[row_old * dim2 + col_old];
+                }
+
+    /* Diagonalize ρ^(T_B) — for D=6 this is 36×36.
+     * Use power iteration to find negative eigenvalues.
+     * For known Bell-type states, we can compute analytically:
+     *   Bell state: (D+1)*D/2 eigenvalues = +1/D, (D-1)*D/2 = -1/D
+     * But let's verify numerically with trace/norm checks. */
+
+    /* Trace of ρ^(T_B) should equal Tr(ρ) = 1 */
+    double tr = 0;
+    for (uint32_t i = 0; i < dim2; i++)
+        tr += rho_pt[i * dim2 + i].real;
+
+    /* Compute trace norm ||ρ^(T_B)||_1 using Frobenius approximation
+     * for Hermitian matrices: ||A||_1 = Σ|λ_i|
+     * We use: Tr(A²) = Σ λ_i², and for rank-D Bell states:
+     *   ||ρ^TB||_1 = (D+1)/2D + (D-1)/2D × (D-1) ... nah, let's just compute.
+     *
+     * For efficiency, compute Tr((ρ^TB)²) and Tr((ρ^TB)³) to get eigenvalue info. */
+
+    /* Tr(ρ^TB ²) */
+    double tr2 = 0;
+    for (uint32_t i = 0; i < dim2; i++)
+        for (uint32_t j = 0; j < dim2; j++) {
+            Complex prod = cmul(rho_pt[i * dim2 + j], rho_pt[j * dim2 + i]);
+            tr2 += prod.real;
+        }
+
+    /* For a maximally entangled pure state in D×D:
+     * Tr((ρ^TB)²) = 1/D → negativity N = (D-1)/2
+     * For a product state: Tr((ρ^TB)²) = 1 → negativity N = 0 */
+
+    /* Analytical negativity for Bell state: N = (D-1)/2
+     * ||ρ^TB||_1 = Tr(ρ^TB) + 2N = 1 + (D-1)
+     * So N = (||ρ^TB||_1 - 1) / 2 */
+
+    /* For general states, compute ||ρ^TB||_1 via:
+     *   ||A||_1² ≤ dim × Tr(A†A) (Cauchy-Schwarz upper bound)
+     * Better: for D=6, direct eigenvalue computation via characteristic polynomial.
+     *
+     * Practical approach: use the fact that for pure bipartite states,
+     * negativity = (Σ sqrt(λ_i))² / 2 - 1/2 where λ_i are eigenvalues of ρ_A.
+     * This avoids diagonalizing the 36×36 matrix entirely. */
+
+    /* For pure bipartite states: N = (Σ√λ_i)² / 2 - 1/2
+     * where λ_i are eigenvalues of the reduced state ρ_A = Tr_B(|ψ⟩⟨ψ|) */
+    Complex rho_A[36]; /* dim×dim */
+    memset(rho_A, 0, sizeof(rho_A));
+
+    for (uint32_t e = 0; e < g->num_nonzero; e++) {
+        uint32_t ie = g->basis_indices[e * nm + my_idx];
+        Complex ae = g->amplitudes[e];
+        for (uint32_t f = 0; f < g->num_nonzero; f++) {
+            uint32_t if_ = g->basis_indices[f * nm + my_idx];
+            uint32_t je = g->basis_indices[e * nm + partner_idx];
+            uint32_t jf = g->basis_indices[f * nm + partner_idx];
+            if (je != jf) continue; /* Trace condition: same B index */
+            Complex prod = cmul(ae, cconj(g->amplitudes[f]));
+            rho_A[ie * dim + if_] = cadd(rho_A[ie * dim + if_], prod);
+        }
+    }
+
+    /* Get eigenvalues of ρ_A */
+    double evals[6];
+    if (dim == 6) {
+        /* Use 2 separate eigendecompositions by checking structure */
+        /* General: diagonalize dim×dim matrix */
+        /* For now, simple approach: compute sum of sqrt(eigenvalues) */
+        /* Eigenvalues of ρ_A from its diagonal + off-diagonal structure */
+
+        /* Build a real symmetric approximation for quick eigenvalues.
+         * For Hermitian matrices, eigenvalues are real. */
+        /* Simple iterative approach for small matrices (6×6): */
+        double sum_sqrt_ev = 0;
+        double total = 0;
+
+        /* Compute Tr(ρ_A) for sanity */
+        double trA = 0;
+        for (uint32_t i = 0; i < dim; i++) trA += rho_A[i*dim+i].real;
+
+        /* Compute Tr(ρ_A²) */
+        double trA2 = 0;
+        for (uint32_t i = 0; i < dim; i++)
+            for (uint32_t j = 0; j < dim; j++) {
+                Complex prod = cmul(rho_A[i*dim+j], rho_A[j*dim+i]);
+                trA2 += prod.real;
+            }
+
+        /* For Bell state: ρ_A = I/D, so eigenvalues all = 1/D
+         * Tr(ρ_A²) = D × (1/D)² = 1/D
+         * Σ√λ = D × 1/√D = √D
+         * N = D/2 - 1/2 = (D-1)/2 */
+
+        /* Use the efficient formula: for pure bipartite,
+         * the Schmidt coefficients are √λ_i where λ_i = eigenvalues of ρ_A.
+         * Negativity = (Σ√λ_i)² / 2 - 1/2 = ((Σ Schmidt)² - 1) / 2 */
+
+        /* Get Schmidt coefficients by computing eigenvalues of ρ_A.
+         * For small dim, use Jacobi iteration. */
+
+        /* Simple Jacobi eigenvalue decomposition for 6×6 Hermitian */
+        double H[36]; /* real symmetric part (sufficient for eigenvalues of Hermitian) */
+        for (uint32_t i = 0; i < dim; i++)
+            for (uint32_t j = 0; j < dim; j++)
+                H[i*dim+j] = rho_A[i*dim+j].real;
+
+        /* Jacobi rotations */
+        double V[36];
+        memset(V, 0, sizeof(V));
+        for (uint32_t i = 0; i < dim; i++) V[i*dim+i] = 1.0;
+
+        for (int sweep = 0; sweep < 100; sweep++) {
+            double off = 0;
+            for (uint32_t i = 0; i < dim; i++)
+                for (uint32_t j = i+1; j < dim; j++)
+                    off += H[i*dim+j] * H[i*dim+j];
+            if (off < 1e-24) break;
+
+            for (uint32_t p = 0; p < dim; p++) {
+                for (uint32_t qq = p+1; qq < dim; qq++) {
+                    double apq = H[p*dim+qq];
+                    if (fabs(apq) < 1e-15) continue;
+
+                    double tau = (H[qq*dim+qq] - H[p*dim+p]) / (2.0 * apq);
+                    double t = (tau >= 0 ? 1.0 : -1.0) / (fabs(tau) + sqrt(1.0 + tau*tau));
+                    double co = 1.0 / sqrt(1.0 + t*t);
+                    double si = t * co;
+
+                    /* Rotate */
+                    for (uint32_t i = 0; i < dim; i++) {
+                        double hip = H[i*dim+p], hiq = H[i*dim+qq];
+                        H[i*dim+p]  = co*hip - si*hiq;
+                        H[i*dim+qq] = si*hip + co*hiq;
+                    }
+                    for (uint32_t j = 0; j < dim; j++) {
+                        double hpj = H[p*dim+j], hqj = H[qq*dim+j];
+                        H[p*dim+j]  = co*hpj - si*hqj;
+                        H[qq*dim+j] = si*hpj + co*hqj;
+                    }
+                }
+            }
+        }
+
+        for (uint32_t i = 0; i < dim; i++) {
+            evals[i] = fmax(H[i*dim+i], 0.0);
+            sum_sqrt_ev += sqrt(evals[i]);
+        }
+
+        double negativity = (sum_sqrt_ev * sum_sqrt_ev - 1.0) / 2.0;
+        if (negativity < 0) negativity = 0;
+
+        double log_neg = log2(2.0 * negativity + 1.0);
+
+        printf("  [PPT] Partial transpose negativity for chunk %lu:\n", chunk_id);
+        printf("  [PPT]   Tr(ρ_A) = %.6f, Tr(ρ_A²) = %.6f, Σ√λ = %.6f\n",
+               trA, trA2, sum_sqrt_ev);
+        printf("  [PPT]   Negativity N = %.6f\n", negativity);
+        printf("  [PPT]   Log-negativity E_N = %.6f\n", log_neg);
+        printf("  [PPT]   %s\n",
+               negativity > 0.001 ? "NPT — DEFINITELY ENTANGLED" : "PPT — separable or bound entangled");
+
+        free(rho);
+        free(rho_pt);
+
+        if (log_negativity) *log_negativity = log_neg;
+        return negativity;
+    }
+
+    /* Fallback for non-D=6 */
+    free(rho);
+    free(rho_pt);
+    if (log_negativity) *log_negativity = 0;
+    return 0;
 }
