@@ -12,6 +12,7 @@
 
 #include "hexstate_engine.h"
 #include "born_rule.h"
+#include "superposition.h"
 
 #include <stdio.h>
 #include <stdlib.h>
