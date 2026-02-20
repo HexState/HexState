@@ -36,26 +36,21 @@ void mps_overlay_init(QuhitEngine *eng, uint32_t *quhits, int n)
 
 void mps_overlay_write_w_state(QuhitEngine *eng, uint32_t *quhits, int n)
 {
-    double norm = 1.0 / sqrt((double)n);
+    /* Distribute normalization evenly: each site gets N^{-1/(2N)} */
+    /* This ensures the right density transfer matrix is well-conditioned */
+    double site_scale = pow((double)n, -1.0 / (2.0 * n));
 
     for (int i = 0; i < n; i++) {
         int pid = eng->quhits[quhits[i]].pair_id;
-        if (pid < 0) continue; /* Should not happen if initialized */
+        if (pid < 0) continue;
         QuhitPair *p = &eng->pairs[pid];
 
-        /* A[0] = Identity on bond */
-        mps_write_tensor(p, 0, 0, 0, 1.0, 0.0); /* 0->0 */
-        mps_write_tensor(p, 0, 1, 1, 1.0, 0.0); /* 1->1 */
+        /* A[0] = Identity on bond (scaled) */
+        mps_write_tensor(p, 0, 0, 0, site_scale, 0.0);
+        mps_write_tensor(p, 0, 1, 1, site_scale, 0.0);
 
-        /* A[1] = Transition 0->1 */
-        mps_write_tensor(p, 1, 0, 1, 1.0, 0.0);
-
-        /* Apply normalization factor to the first site */
-        if (i == 0) {
-            mps_write_tensor(p, 0, 0, 0, norm, 0.0);
-            mps_write_tensor(p, 0, 1, 1, norm, 0.0);
-            mps_write_tensor(p, 1, 0, 1, norm, 0.0);
-        }
+        /* A[1] = Transition 0→1 (scaled) */
+        mps_write_tensor(p, 1, 0, 1, site_scale, 0.0);
     }
 }
 
