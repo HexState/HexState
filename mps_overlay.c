@@ -655,20 +655,14 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
 
     free(M_re); free(M_im);
 
-    /* ── LOCAL O(1) RENORMALIZATION ──────────────────────────────
-     * In mixed-canonical form, kept_norm_sq = Σ σ_t² IS the exact
-     * global norm ||ψ||². We rescale σ to restore ||ψ|| = 1.0
-     * without touching the rest of the chain.  Cost: O(χ) = O(1).
-     * U columns were computed above using original σ so they remain
-     * orthonormal (left-canonical).
-     * ─────────────────────────────────────────────────────────── */
-    double kept_norm_sq = 0;
-    for (int t = 0; t < MPS_CHI; t++) kept_norm_sq += sig[t] * sig[t];
-
-    if (kept_norm_sq > 1e-30) {
-        double scale = 1.0 / sqrt(kept_norm_sq);
-        for (int t = 0; t < MPS_CHI; t++) sig[t] *= scale;
-    }
+    /* ── LOCAL NORM TRACKING ────────────────────────────────────
+     * In a general (non-canonical) MPS, the local norm Σ σ_t²
+     * is NOT the global norm. We leave σ as-is to avoid
+     * corrupting the quantum state.  Renormalization is only
+     * valid after a full left-to-right sweep that puts the
+     * chain in left-canonical form.
+     * ─────────────────────────────────────────────────────── */
+    (void)0; /* placeholder — no renormalization */
 
     /* Step 6: Write back — direction depends on sweep
      *
