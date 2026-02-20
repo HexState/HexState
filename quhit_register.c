@@ -221,3 +221,255 @@ uint64_t quhit_reg_measure(QuhitEngine *eng, int reg_idx,
 
     return (uint64_t)outcome;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * STREAMING STATE VECTOR — O(1) on-the-fly amplitude access
+ *
+ * Following statevector.h's sv_get() pattern:
+ *   addr(k) = base + k × 16  (SV_ELEMENT_SIZE)
+ *
+ * quhit_reg_sv_get(reg, k) computes the amplitude of basis state |k⟩
+ * in the full D^N Hilbert space WITHOUT materializing the state vector.
+ *
+ * For GHZ state (1/√D) Σ|m,m,...,m⟩:
+ *   - Basis state k encodes multi-index (q₀, q₁, ..., q_{N-1}) in base D
+ *   - Amplitude is nonzero only if all qᵢ are equal
+ *   - i.e., k must be of the form m × (D^N - 1)/(D - 1) for some m ∈ [0,D)
+ *   - Quick check: all digits of k in base D must be the same
+ *
+ * For general register states (post-DFT, post-CZ):
+ *   - Linear scan through stored entries for matching basis_state
+ *
+ * Memory: O(1) per call. No allocation. The full state vector is never stored.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
+                              uint64_t basis_k)
+{
+    SV_Amplitude amp = {0.0, 0.0};
+    if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return amp;
+    QuhitRegister *reg = &eng->registers[reg_idx];
+    uint32_t D = reg->dim;
+
+    if (reg->bulk_rule == 1) {
+        /*
+         * GHZ mode: amplitude is nonzero only if ALL N digits are equal.
+         * Extract first digit and verify all others match.
+         * This is O(log_D(k)) ≈ O(N) in digit count, but effectively O(1)
+         * for pattern detection: just check if k mod D == k/D mod D == ...
+         */
+        uint32_t first_digit = (uint32_t)(basis_k % D);
+        uint64_t remaining = basis_k;
+        int all_same = 1;
+
+        /* Check each digit — early exit on mismatch */
+        for (uint64_t q = 0; q < reg->n_quhits && all_same; q++) {
+            if ((remaining % D) != first_digit) {
+                all_same = 0;
+            }
+            remaining /= D;
+        }
+
+        /* After extracting N digits, remaining must be 0 (no overflow) */
+        if (remaining != 0) all_same = 0;
+
+        if (all_same) {
+            /* Find the amplitude for this basis entry */
+            for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+                if ((uint32_t)(reg->entries[e].basis_state % D) == first_digit) {
+                    amp.re = reg->entries[e].amp_re;
+                    amp.im = reg->entries[e].amp_im;
+                    return amp;
+                }
+            }
+        }
+        return amp;  /* Zero amplitude */
+    }
+
+    /* General mode: linear scan through stored entries */
+    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+        if (reg->entries[e].basis_state == basis_k) {
+            amp.re = reg->entries[e].amp_re;
+            amp.im = reg->entries[e].amp_im;
+            return amp;
+        }
+    }
+    return amp;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * STREAMING SCAN — Iterate over a window of the state vector
+ *
+ * Following statevector.h's sequential scan pattern (cache-friendly,
+ * optimal for hardware prefetch).
+ *
+ * The callback receives each nonzero amplitude in-order, without the caller
+ * needing to know which basis states are nonzero.
+ *
+ * For GHZ: calls the callback exactly D times (6 for D=6).
+ * For general states: calls once per stored entry.
+ *
+ * This is the streaming interface — process amplitudes without storing them.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+void quhit_reg_sv_stream(QuhitEngine *eng, int reg_idx,
+                         sv_stream_fn callback, void *user_data)
+{
+    if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return;
+    QuhitRegister *reg = &eng->registers[reg_idx];
+
+    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+        SV_Amplitude amp;
+        amp.re = reg->entries[e].amp_re;
+        amp.im = reg->entries[e].amp_im;
+        callback(reg->entries[e].basis_state, amp, user_data);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * STREAMING TOTAL PROBABILITY — sv_total_prob via streaming
+ *
+ * From statevector.h pattern: naive left-to-right accumulation.
+ * Uses streaming scan (no D^N materialization).
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+double quhit_reg_sv_total_prob(QuhitEngine *eng, int reg_idx)
+{
+    if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return 0;
+    QuhitRegister *reg = &eng->registers[reg_idx];
+
+    double total = 0.0;
+    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+        total += reg->entries[e].amp_re * reg->entries[e].amp_re
+               + reg->entries[e].amp_im * reg->entries[e].amp_im;
+    }
+    return total;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * STREAMING INNER PRODUCT — ⟨reg_a | reg_b⟩ via streaming
+ *
+ * From statevector.h: sv_inner_product pattern.
+ * Only nonzero entries contribute — O(min entries) time.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+SV_Amplitude quhit_reg_sv_inner(QuhitEngine *eng, int reg_a, int reg_b)
+{
+    SV_Amplitude result = {0.0, 0.0};
+    if (reg_a < 0 || reg_b < 0) return result;
+    if ((uint32_t)reg_a >= eng->num_registers) return result;
+    if ((uint32_t)reg_b >= eng->num_registers) return result;
+
+    QuhitRegister *ra = &eng->registers[reg_a];
+    QuhitRegister *rb = &eng->registers[reg_b];
+
+    /* O(n_a × n_b) for sparse entries, but n_a, n_b ≤ D typically */
+    for (uint32_t i = 0; i < ra->num_nonzero; i++) {
+        for (uint32_t j = 0; j < rb->num_nonzero; j++) {
+            if (ra->entries[i].basis_state == rb->entries[j].basis_state) {
+                /* ⟨a|b⟩ += conj(a_k) × b_k */
+                double a_re = ra->entries[i].amp_re;
+                double a_im = ra->entries[i].amp_im;
+                double b_re = rb->entries[j].amp_re;
+                double b_im = rb->entries[j].amp_im;
+                result.re += a_re * b_re + a_im * b_im;
+                result.im += a_re * b_im - a_im * b_re;
+            }
+        }
+    }
+    return result;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * PER-QUHIT LOCAL STATE VECTOR — Partial trace to single quhit
+ *
+ * Returns the D=6 local state vector (QuhitState, 96 bytes) for any
+ * quhit at position `quhit_pos` in the register.
+ *
+ * This is the partial trace Tr_{≠pos}(|ψ⟩⟨ψ|) — the reduced density
+ * matrix's diagonal, projected back to a pure-state approximation.
+ *
+ * From quhit_management.h: QuhitState stores 6 re[] + 6 im[] = 96 bytes.
+ *
+ * For GHZ (1/√D) Σ|m,m,...,m⟩:
+ *   - Quhit at ANY position has marginal: P(k) = |α_k|² = 1/D for each k
+ *   - Local amplitudes: re[k] = 1/√D, im[k] = 0 for all k
+ *   - This is the maximally mixed state (as pure-state projection)
+ *
+ * For general states:
+ *   - Extract digit at `quhit_pos` from each basis entry
+ *   - Accumulate |amplitude|² contributions per digit value
+ *   - Return sqrt(accumulated) as the local amplitude
+ *
+ * Memory: O(D) = O(6) per call. No materialization of D^N.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+static uint32_t reg_extract_digit(uint64_t basis, uint64_t pos,
+                                  uint32_t D, uint8_t bulk_rule)
+{
+    if (bulk_rule == 1) {
+        /* GHZ: all digits are the same = basis_state mod D */
+        (void)pos;
+        return (uint32_t)(basis % D);
+    }
+    /* General: extract digit at position `pos` via base-D decomposition */
+    uint64_t v = basis;
+    for (uint64_t i = 0; i < pos; i++) v /= D;
+    return (uint32_t)(v % D);
+}
+
+QuhitState quhit_reg_local_sv(QuhitEngine *eng, int reg_idx,
+                              uint64_t quhit_pos)
+{
+    QuhitState local;
+    qm_init_zero(&local);
+
+    if (reg_idx < 0 || (uint32_t)reg_idx >= eng->num_registers) return local;
+    QuhitRegister *reg = &eng->registers[reg_idx];
+    uint32_t D = reg->dim;
+
+    /*
+     * Partial trace: for each stored basis entry, extract the digit
+     * at `quhit_pos` and accumulate the amplitude into that digit's slot.
+     *
+     * For entangled states, the local state is mixed (ρ not pure).
+     * We store the marginal amplitudes — the diagonal of ρ in the
+     * computational basis, with phases from the first contributing entry.
+     *
+     * This gives the correct Born probabilities P(k) = Σ_{entries with digit=k} |α|²
+     * and preserves phase information for coherent operations.
+     */
+    double prob[QUHIT_D] = {0};
+    double phase_re[QUHIT_D] = {0};
+    double phase_im[QUHIT_D] = {0};
+
+    for (uint32_t e = 0; e < reg->num_nonzero; e++) {
+        uint32_t digit = reg_extract_digit(reg->entries[e].basis_state,
+                                           quhit_pos, D, reg->bulk_rule);
+        if (digit < D) {
+            double re = reg->entries[e].amp_re;
+            double im = reg->entries[e].amp_im;
+            double p  = re * re + im * im;
+            prob[digit] += p;
+            phase_re[digit] += re;
+            phase_im[digit] += im;
+        }
+    }
+
+    /* Write local state: amplitude = sqrt(prob) with phase direction */
+    for (uint32_t k = 0; k < D; k++) {
+        if (prob[k] > 0) {
+            double mag = sqrt(prob[k]);
+            double norm = sqrt(phase_re[k]*phase_re[k] + phase_im[k]*phase_im[k]);
+            if (norm > 1e-30) {
+                local.re[k] = mag * (phase_re[k] / norm);
+                local.im[k] = mag * (phase_im[k] / norm);
+            } else {
+                local.re[k] = mag;
+                local.im[k] = 0;
+            }
+        }
+    }
+
+    return local;
+}

@@ -205,6 +205,19 @@ void     quhit_reg_apply_cz(QuhitEngine *eng, int reg_idx,
                             uint64_t idx_a, uint64_t idx_b);
 uint64_t quhit_reg_measure(QuhitEngine *eng, int reg_idx, uint64_t quhit_idx);
 
+/* ─── Streaming State Vector (statevector.h compatible) ─── */
+SV_Amplitude quhit_reg_sv_get(QuhitEngine *eng, int reg_idx,
+                              uint64_t basis_k);
+
+typedef void (*sv_stream_fn)(uint64_t basis_state, SV_Amplitude amp,
+                             void *user_data);
+void         quhit_reg_sv_stream(QuhitEngine *eng, int reg_idx,
+                                 sv_stream_fn callback, void *user_data);
+double       quhit_reg_sv_total_prob(QuhitEngine *eng, int reg_idx);
+SV_Amplitude quhit_reg_sv_inner(QuhitEngine *eng, int reg_a, int reg_b);
+QuhitState   quhit_reg_local_sv(QuhitEngine *eng, int reg_idx,
+                                uint64_t quhit_pos);
+
 /* ═══════════════════════════════════════════════════════════════════════════════
  * SELF-TEST
  * ═══════════════════════════════════════════════════════════════════════════════ */
