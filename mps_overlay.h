@@ -103,4 +103,14 @@ void mps_build_hadamard2(double *U_re, double *U_im);
 
 double mps_overlay_norm(QuhitEngine *eng, uint32_t *quhits, int n);
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * DEFERRED RENORMALIZATION
+ *
+ * Set mps_defer_renorm = 1 to skip per-gate O(N) norm computation.
+ * Call mps_renormalize_chain once per layer instead. O(N) per call.
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+extern int mps_defer_renorm;
+void mps_renormalize_chain(QuhitEngine *eng, uint32_t *quhits, int n);
+
 #endif /* MPS_OVERLAY_H */
