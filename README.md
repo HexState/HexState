@@ -481,7 +481,6 @@ HexState-main/
 | **Gate code** | Mixed into 427-line `measure_chunk` | Dedicated `quhit_gates.c` |
 | **MPS support** | None | Full χ=128 engine with randomized truncated SVD + lazy eval |
 | **Side channels** | Interleaved with engine logic | 7 independent header-only primitives |
-| **BigInt** | Assembly (`bigint.asm`) | Portable C (`bigint.c`) |
 | **Measurement** | Single monolithic function | Separate local / entangled / register paths |
 | **Constants** | Computed at runtime | Hex-exact, precomputed in headers |
 
@@ -514,8 +513,6 @@ The engine's strict pairwise monogamy produces GHZ states with a property: regar
 
 ### Entanglement Growth — The Gold Standard (χ=128)
 
-`entanglement_experiment.c` demonstrates full entanglement dynamics with **Haar-random U(6)** gates and **CZ₆** entangling gates at bond dimension χ=128. The randomized truncated SVD preserves the full quantum state losslessly (reconstruction error = 10⁻¹⁶).
-
 #### N=100 Qudits (Single CPU Core, 11.8 minutes)
 
 | Metric | Value |
@@ -531,13 +528,9 @@ The engine's strict pairwise monogamy produces GHZ states with a property: regar
 
 > For comparison, Google's Sycamore verification required **27,648 GPUs** on Summit for ~38 qubits (10¹¹ amplitudes). HexState handles **10⁷⁸ amplitudes** — **10⁶⁷× larger** — on a single core.
 
-Full results: [ENTANGLEMENT_EXPERIMENT.md](ENTANGLEMENT_EXPERIMENT.md)
-
 ---
 
 ### Google Willow RCS Replication (χ=6)
-
-`willow_benchmark.c` replicates Google's Random Circuit Sampling methodology using DFT₆/Hadamard gates at χ=6 (exact for DFT+CZ circuits):
 
 | Scale | Depth | Time | Memory | Norm² | Hilbert Dim |
 |---|---|---|---|---|---|
@@ -553,15 +546,6 @@ Full results: [ENTANGLEMENT_EXPERIMENT.md](ENTANGLEMENT_EXPERIMENT.md)
 
 **vs Willow**: Google's 105-qubit chip operates in 2^105 ≈ 10^31 dimensions with XEB ≈ 0.15 (noisy). HexState runs the same depth-20 circuit **noiselessly** and scales 95× beyond Willow's qubit count — in a Hilbert space with **7,751 more orders of magnitude**.
 
-### Build & Run
-
-```bash
-gcc -O2 -std=gnu99 willow_benchmark.c quhit_core.c quhit_gates.c \
-    quhit_measure.c quhit_entangle.c quhit_register.c mps_overlay.c \
-    bigint.c -lm -o willow_benchmark
-./willow_benchmark
-```
-
 ## License
 
-See repository for license details.
+MIT
