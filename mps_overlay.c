@@ -699,7 +699,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                 for (int bp = 0; bp < MPS_CHI; bp++)
                     mps_write_tensor(sj, lp, bp, g,
                                      sig[bp]*vc_re[bp*DCHI+cc],
-                                     sig[bp]*vc_im[bp*DCHI+cc]);
+                                     -sig[bp]*vc_im[bp*DCHI+cc]);
             }
     } else {
         for (int kp = 0; kp < MPS_PHYS; kp++)
@@ -715,7 +715,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                 int cc = lp * MPS_CHI + g;
                 for (int bp = 0; bp < MPS_CHI; bp++)
                     mps_write_tensor(sj, lp, bp, g,
-                                     vc_re[bp*DCHI+cc], vc_im[bp*DCHI+cc]);
+                                     vc_re[bp*DCHI+cc], -vc_im[bp*DCHI+cc]);
             }
     }
 
