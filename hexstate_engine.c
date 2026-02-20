@@ -1832,7 +1832,7 @@ void braid_chunks_dim(HexStateEngine *eng, uint64_t a, uint64_t b,
             g->total_dim = td;
             g->amplitudes = sv_calloc_aligned(td, sizeof(Complex));
 
-            double amp = born_fast_isqrt((double)dim);
+            double amp = 1.0 / sqrt((double)dim);
             for (uint32_t k = 0; k < dim; k++) {
                 /* Bell state: |k,k⟩ → flat index = k*D + k */
                 g->amplitudes[k * dim + k] = cmplx(amp, 0.0);
@@ -3773,7 +3773,7 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
         for (uint32_t i = my_idx + 1; i < nm; i++) my_stride *= dim;
         for (uint64_t flat = 0; flat < g->total_dim; flat++) {
             uint32_t my_val = (uint32_t)((flat / my_stride) % dim);
-            if (my_val < NUM_BASIS_STATES)
+            if (my_val < MAX_SNAP_DIM)
                 snap.marginal_probs[my_val] += cnorm2(g->amplitudes[flat]);
         }
 
@@ -3787,12 +3787,12 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
             uint32_t j = (uint32_t)((flat1 / my_stride) % dim);
             uint64_t base1 = flat1 - (uint64_t)j * my_stride;
 
-            for (uint32_t k = 0; k < dim && k < NUM_BASIS_STATES; k++) {
+            for (uint32_t k = 0; k < dim && k < MAX_SNAP_DIM; k++) {
                 uint64_t flat2 = base1 + (uint64_t)k * my_stride;
                 Complex a2 = g->amplitudes[flat2];
                 if (cnorm2(a2) < 1e-28) continue;
 
-                if (j < NUM_BASIS_STATES && k < NUM_BASIS_STATES) {
+                if (j < MAX_SNAP_DIM && k < MAX_SNAP_DIM) {
                     snap.rho[j * dim + k].real += a1.real * a2.real + a1.imag * a2.imag;
                     snap.rho[j * dim + k].imag += a1.imag * a2.real - a1.real * a2.imag;
                 }
@@ -3801,8 +3801,8 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
 
         /* ── Purity: Tr(ρ²) ── */
         snap.purity = 0.0;
-        for (uint32_t j = 0; j < dim && j < NUM_BASIS_STATES; j++) {
-            for (uint32_t k = 0; k < dim && k < NUM_BASIS_STATES; k++) {
+        for (uint32_t j = 0; j < dim && j < MAX_SNAP_DIM; j++) {
+            for (uint32_t k = 0; k < dim && k < MAX_SNAP_DIM; k++) {
                 Complex rho_jk = snap.rho[j * dim + k];
                 Complex rho_kj = snap.rho[k * dim + j];
                 snap.purity += rho_jk.real * rho_kj.real - rho_jk.imag * rho_kj.imag;
@@ -3811,8 +3811,8 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
 
         /* ── Von Neumann entropy: S = -Tr(ρ log₂ ρ) ──
          * Compute eigenvalues of the reduced density matrix */
-        if (dim <= NUM_BASIS_STATES) {
-            double eigenvalues[NUM_BASIS_STATES] = {0};
+        if (dim <= MAX_SNAP_DIM) {
+            double eigenvalues[MAX_SNAP_DIM] = {0};
 
             if (dim == 2) {
                 /* Fast path for dim=2 */
@@ -3823,7 +3823,7 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
                     &eigenvalues[0], &eigenvalues[1]);
             } else {
                 /* General Jacobi */
-                Complex rho_copy[NUM_BASIS_STATES * NUM_BASIS_STATES];
+                Complex rho_copy[MAX_SNAP_DIM * MAX_SNAP_DIM];
                 memcpy(rho_copy, snap.rho, sizeof(rho_copy));
                 eigen_hermitian_jacobi(rho_copy, dim, eigenvalues);
             }
@@ -3860,7 +3860,7 @@ HilbertSnapshot inspect_hilbert(HexStateEngine *eng, uint64_t chunk_id)
             snap.entries[i].probability = amp.real * amp.real + amp.imag * amp.imag;
             snap.entries[i].phase_rad = atan2(amp.imag, amp.real);
             snap.total_probability += snap.entries[i].probability;
-            if (i < NUM_BASIS_STATES)
+            if (i < MAX_SNAP_DIM)
                 snap.marginal_probs[i] = snap.entries[i].probability;
         }
 
@@ -3918,7 +3918,7 @@ void inspect_print(HilbertSnapshot *snap)
 
     /* Marginal probabilities */
     printf("\n  ── Marginal Probabilities (this register) ──\n    ");
-    for (uint32_t k = 0; k < snap->dim && k < NUM_BASIS_STATES; k++)
+    for (uint32_t k = 0; k < snap->dim && k < MAX_SNAP_DIM; k++)
         printf("P(|%u⟩)=%.4f  ", k, snap->marginal_probs[k]);
     printf("\n");
 
@@ -5270,7 +5270,7 @@ HilbertSnapshot inspect_quhit(HexStateEngine *eng, uint64_t chunk_id,
         snap.total_probability += p;
 
         uint32_t v = lazy_resolve(ent, quhit_idx, eng->quhit_regs[r].bulk_rule, eng->quhit_regs[r].dim);
-        if (v < NUM_BASIS_STATES) snap.marginal_probs[v] += p;
+        if (v < MAX_SNAP_DIM) snap.marginal_probs[v] += p;
     }
 
     snap.purity = 1.0;
