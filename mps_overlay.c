@@ -449,18 +449,16 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
             v_cols[t][i] = (top[t] >= 0) ? V[i][top[t]] : 0;
     }
 
-    /* ── RENORMALIZE after truncation ──────────────────────────────
-     * Track whether SVD actually truncated any weight.
-     * If it did, we need a global norm correction afterwards.
+    /* ── LOCAL O(1) RENORMALIZATION ──────────────────────────────
+     * In mixed-canonical form, kept_norm_sq = Σ σ_t² IS the exact
+     * global norm ||ψ||². We rescale σ to restore ||ψ|| = 1.0
+     * without touching the rest of the chain.  Cost: O(χ) = O(1).
      * ─────────────────────────────────────────────────────────── */
-    double full_norm_sq = 0;
-    for (int i = 0; i < DCHI; i++) full_norm_sq += fabs(H[i][i]);
-
     double kept_norm_sq = 0;
     for (int t = 0; t < MPS_CHI; t++) kept_norm_sq += sig[t] * sig[t];
 
-    if (kept_norm_sq > 1e-30 && full_norm_sq > kept_norm_sq * 1.0000001) {
-        double scale = sqrt(full_norm_sq / kept_norm_sq);
+    if (kept_norm_sq > 1e-30) {
+        double scale = 1.0 / sqrt(kept_norm_sq);
         for (int t = 0; t < MPS_CHI; t++) sig[t] *= scale;
     }
 
@@ -503,63 +501,6 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
 
     free(H);
     free(V);
-
-    /* ── GLOBAL RENORMALIZATION ────────────────────────────────────
-     * After SVD truncation, compute ||ψ||² = Tr(transfer matrix)
-     * and rescale site si to restore unitarity.
-     * OPTIMIZATION: only run O(n) norm if local SVD actually
-     * truncated weight (full_norm_sq > kept_norm_sq).
-     * For lossless gates (GHZ, Bell), this is skipped → O(1).
-     * ──────────────────────────────────────────────────────────── */
-    if (full_norm_sq > kept_norm_sq * 1.0000001 && !mps_defer_renorm) {
-        /* Compute global norm via transfer matrix contraction */
-        double rho_re[MPS_CHI][MPS_CHI] = {{0}};
-        double rho_im[MPS_CHI][MPS_CHI] = {{0}};
-        rho_re[0][0] = 1.0;
-
-        for (int site2 = 0; site2 < n; site2++) {
-            double nr[MPS_CHI][MPS_CHI] = {{0}};
-            double ni2[MPS_CHI][MPS_CHI] = {{0}};
-            for (int k = 0; k < MPS_PHYS; k++) {
-                double Ak_re[MPS_CHI][MPS_CHI], Ak_im[MPS_CHI][MPS_CHI];
-                for (int a = 0; a < MPS_CHI; a++)
-                    for (int b = 0; b < MPS_CHI; b++)
-                        mps_read_tensor(site2, k, a, b, &Ak_re[a][b], &Ak_im[a][b]);
-                double tr2[MPS_CHI][MPS_CHI] = {{0}};
-                double ti2[MPS_CHI][MPS_CHI] = {{0}};
-                for (int a = 0; a < MPS_CHI; a++)
-                    for (int bp = 0; bp < MPS_CHI; bp++)
-                        for (int ap = 0; ap < MPS_CHI; ap++) {
-                            tr2[a][bp] += rho_re[a][ap]*Ak_re[ap][bp] - rho_im[a][ap]*Ak_im[ap][bp];
-                            ti2[a][bp] += rho_re[a][ap]*Ak_im[ap][bp] + rho_im[a][ap]*Ak_re[ap][bp];
-                        }
-                for (int b = 0; b < MPS_CHI; b++)
-                    for (int bp = 0; bp < MPS_CHI; bp++)
-                        for (int a = 0; a < MPS_CHI; a++) {
-                            double ar2 = Ak_re[a][b], ai2 = -Ak_im[a][b];
-                            nr[b][bp] += ar2*tr2[a][bp] - ai2*ti2[a][bp];
-                            ni2[b][bp] += ar2*ti2[a][bp] + ai2*tr2[a][bp];
-                        }
-            }
-            memcpy(rho_re, nr, sizeof(rho_re));
-            memcpy(rho_im, ni2, sizeof(rho_im));
-        }
-
-        double norm = 0;
-        for (int i = 0; i < MPS_CHI; i++) norm += rho_re[i][i];
-
-        /* Rescale site si if norm significantly differs from 1 */
-        if (norm > 1e-30 && fabs(norm - 1.0) > 1e-12) {
-            double scale = 1.0 / sqrt(norm);
-            for (int k = 0; k < MPS_PHYS; k++)
-                for (int a = 0; a < MPS_CHI; a++)
-                    for (int b = 0; b < MPS_CHI; b++) {
-                        double tr, ti;
-                        mps_read_tensor(si, k, a, b, &tr, &ti);
-                        mps_write_tensor(si, k, a, b, tr * scale, ti * scale);
-                    }
-        }
-    }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════════
