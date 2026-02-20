@@ -1,0 +1,214 @@
+/*
+ * ═══════════════════════════════════════════════════════════════════════════════
+ * quhit_engine.h — Quhit Engine: 6-State Quantum Processor
+ * ═══════════════════════════════════════════════════════════════════════════════
+ *
+ * Master header for the modular Quhit engine.
+ *
+ * Architecture:
+ *   - Each quhit = 6 complex amplitudes (96 bytes)
+ *   - Entangled pair = 36 complex amplitudes (576 bytes)
+ *   - Total memory: O(N) for locals + O(P) for pairs
+ *   - Never O(D^N) — polynomial, not exponential
+ *
+ * Side-channel primitives (header-only, already extracted):
+ *   arithmetic.h      — IEEE-754 constants, magic numbers
+ *   born_rule.h       — Born-rule sampling, fast inverse sqrt
+ *   statevector.h     — Cache-aligned state vector storage
+ *   superposition.h   — DFT₆, twiddle tables, superposition
+ *   entanglement.h    — Joint states, Bell, partial trace
+ *   quhit_management.h — Per-quhit state management
+ *
+ * Component files:
+ *   quhit_core.c      — Engine lifecycle, PRNG, chunk init
+ *   quhit_gates.c     — CZ, DFT, local unitaries
+ *   quhit_measure.c   — Born-rule measurement, inspect, snapshot
+ *   quhit_entangle.c  — Braid, product state, unbraid
+ *   quhit_register.c  — 100T-scale quhit register API
+ */
+
+#ifndef QUHIT_ENGINE_H
+#define QUHIT_ENGINE_H
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <math.h>
+
+/* ─── Side-channel primitives ─── */
+#include "arithmetic.h"
+#include "born_rule.h"
+#include "statevector.h"
+#include "superposition.h"
+#include "entanglement.h"
+#include "quhit_management.h"
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * CONSTANTS
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+#define QUHIT_D             6           /* Dimension per quhit              */
+#define QUHIT_D2            36          /* D² = joint state dimension       */
+#define QUHIT_LOCAL_BYTES   96          /* 6 × 16 bytes per quhit          */
+#define QUHIT_JOINT_BYTES   576         /* 36 × 16 bytes per pair          */
+
+#define MAX_QUHITS          65536       /* Max quhits in engine             */
+#define MAX_PAIRS           32768       /* Max entangled pairs              */
+#define MAX_REGISTERS       256         /* Max quhit registers              */
+#define MAX_CZ_DEFERRED     4096        /* Max deferred CZ per pair         */
+
+#define MAGIC_TAG           0xBEEF      /* Magic pointer tag                */
+#define MAGIC_PTR(chunk, k) (((uint64_t)MAGIC_TAG << 48) | ((uint64_t)(chunk) << 16) | (k))
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * DATA STRUCTURES
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* ─── Single Quhit ─── */
+typedef struct {
+    QuhitState   state;             /* 6 complex amplitudes (96 bytes)      */
+    uint32_t     id;                /* Quhit identifier                     */
+    uint8_t      collapsed;         /* 1 = measured                         */
+    uint32_t     collapse_value;    /* Measured outcome                     */
+    int32_t      pair_id;           /* Index into pairs[] or -1             */
+    uint8_t      pair_side;         /* 0 = A side, 1 = B side              */
+} Quhit;
+
+/* ─── Entangled Pair ─── */
+typedef struct {
+    QuhitJoint   joint;             /* 36 complex amplitudes (576 bytes)    */
+    uint32_t     id_a;              /* Quhit A index                        */
+    uint32_t     id_b;              /* Quhit B index                        */
+    uint8_t      active;            /* 1 = pair is live                     */
+    uint32_t     num_cz;            /* Deferred CZ count                    */
+} QuhitPair;
+
+/* ─── Quhit Register (100T-scale, Magic Pointer Hilbert Space) ─── */
+typedef struct {
+    uint64_t     chunk_id;          /* Parent chunk ID                      */
+    uint64_t     n_quhits;          /* Number of quhits in register         */
+    uint32_t     dim;               /* Dimension per quhit (D=6)            */
+    uint8_t      bulk_rule;         /* 0=constant, 1=cyclic V(k)=k%D       */
+
+    /* The Hilbert Space — self-describing sparse entries */
+    uint32_t     num_nonzero;       /* Active basis entries                 */
+    struct {
+        uint64_t basis_state;       /* Packed basis: Σ q_k × D^k           */
+        double   amp_re;            /* Real amplitude                       */
+        double   amp_im;            /* Imaginary amplitude                  */
+    } entries[4096];                /* Sparse amplitude storage             */
+
+    uint8_t      collapsed;         /* 1 = measurement has occurred         */
+    uint32_t     collapse_outcome;  /* Determined value (all members)       */
+    uint64_t     magic_base;        /* Base Magic Pointer for register      */
+} QuhitRegister;
+
+/* ─── Inspection Snapshot (non-destructive readout) ─── */
+typedef struct {
+    uint32_t     quhit_id;          /* Which quhit was inspected            */
+    uint32_t     dim;               /* Dimension (6)                        */
+    double       probs[QUHIT_D];    /* Marginal probabilities P(k)          */
+    double       total_prob;        /* Sum of probabilities (should be 1.0) */
+    double       entropy;           /* Von Neumann entropy (bits)           */
+    double       purity;            /* Tr(ρ²)                               */
+    int          is_entangled;      /* 1 if part of a pair                  */
+    int          schmidt_rank;      /* 1=product, >1=entangled              */
+
+    /* Joint state entries (if entangled) */
+    uint32_t     num_entries;
+    struct {
+        uint32_t idx_a, idx_b;      /* Basis indices |a,b⟩                  */
+        double   amp_re, amp_im;    /* Complex amplitude                    */
+        double   probability;       /* |amplitude|²                         */
+        double   phase_rad;         /* Phase angle                          */
+    } entries[QUHIT_D2];
+} QuhitSnapshot;
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * ENGINE
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    /* ─── Quhit array ─── */
+    Quhit        quhits[MAX_QUHITS];
+    uint32_t     num_quhits;
+
+    /* ─── Entangled pairs ─── */
+    QuhitPair    pairs[MAX_PAIRS];
+    uint32_t     num_pairs;
+
+    /* ─── Quhit registers (100T scale) ─── */
+    QuhitRegister registers[MAX_REGISTERS];
+    uint32_t     num_registers;
+
+    /* ─── PRNG state ─── */
+    uint64_t     prng_state;
+
+    /* ─── Measurement log ─── */
+    uint32_t     measured_values[MAX_QUHITS];
+} QuhitEngine;
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * API — quhit_core.c
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+void     quhit_engine_init(QuhitEngine *eng);
+void     quhit_engine_destroy(QuhitEngine *eng);
+uint64_t quhit_prng(QuhitEngine *eng);
+double   quhit_prng_double(QuhitEngine *eng);
+
+uint32_t quhit_init(QuhitEngine *eng);           /* Init to |0⟩, returns id  */
+uint32_t quhit_init_plus(QuhitEngine *eng);       /* Init to |+⟩             */
+uint32_t quhit_init_basis(QuhitEngine *eng, uint32_t k); /* Init to |k⟩      */
+void     quhit_reset(QuhitEngine *eng, uint32_t id);     /* Reset to |0⟩      */
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * API — quhit_gates.c
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+void quhit_apply_dft(QuhitEngine *eng, uint32_t id);
+void quhit_apply_idft(QuhitEngine *eng, uint32_t id);
+void quhit_apply_cz(QuhitEngine *eng, uint32_t id_a, uint32_t id_b);
+void quhit_apply_unitary(QuhitEngine *eng, uint32_t id,
+                         const double *U_re, const double *U_im);
+void quhit_apply_phase(QuhitEngine *eng, uint32_t id,
+                       const double *phases);
+void quhit_apply_x(QuhitEngine *eng, uint32_t id); /* X = cyclic shift */
+void quhit_apply_z(QuhitEngine *eng, uint32_t id); /* Z = phase gate    */
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * API — quhit_measure.c
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+uint32_t quhit_measure(QuhitEngine *eng, uint32_t id);
+void     quhit_inspect(QuhitEngine *eng, uint32_t id, QuhitSnapshot *snap);
+double   quhit_prob(QuhitEngine *eng, uint32_t id, uint32_t outcome);
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * API — quhit_entangle.c
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+int  quhit_entangle_bell(QuhitEngine *eng, uint32_t id_a, uint32_t id_b);
+int  quhit_entangle_product(QuhitEngine *eng, uint32_t id_a, uint32_t id_b);
+void quhit_disentangle(QuhitEngine *eng, uint32_t id_a, uint32_t id_b);
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * API — quhit_register.c
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+int      quhit_reg_init(QuhitEngine *eng, uint64_t chunk_id,
+                        uint64_t n_quhits, uint32_t dim);
+void     quhit_reg_entangle_all(QuhitEngine *eng, int reg_idx);
+void     quhit_reg_apply_dft(QuhitEngine *eng, int reg_idx, uint64_t quhit_idx);
+void     quhit_reg_apply_cz(QuhitEngine *eng, int reg_idx,
+                            uint64_t idx_a, uint64_t idx_b);
+uint64_t quhit_reg_measure(QuhitEngine *eng, int reg_idx, uint64_t quhit_idx);
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * SELF-TEST
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+int quhit_self_test(void);
+
+#endif /* QUHIT_ENGINE_H */
