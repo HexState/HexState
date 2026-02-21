@@ -324,6 +324,14 @@ void mps_gate_1site(QuhitEngine *eng, uint32_t *quhits, int n,
  * projection subspace for subsequent calls. */
 static uint64_t mps_substrate_seed = 0xA09E667F3BCC908BULL; /* √2 mantissa */
 
+/* ── SIDE-CHANNEL η: Per-site adaptive χ_eff ──────────────────────
+ * Track the effective rank from each site's previous SVD.
+ * Next SVD at this site uses k = χ_eff_prev + margin instead
+ * of fixed k = χ + 10 = 138.  Speedup: (χ/χ_eff)³.
+ * Initialized to MPS_CHI (conservative start). */
+static int mps_chi_eff_prev[4096]; /* per-site effective rank history */
+static int mps_chi_eff_initialized = 0;
+
 #define DCHI (MPS_PHYS * MPS_CHI) /* D × χ */
 
 /* Helper macros for flat 4D array: Th[k][l][a][g] */
@@ -493,7 +501,25 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
      *   6. Extract σ, V, U from small SVD + Q
      */
 
-    int k = MPS_CHI + 10;
+    /* ── SIDE-CHANNEL η: Adaptive k from previous χ_eff ───────────
+     * Instead of always using k = χ + 10 = 138, use the effective
+     * rank from this site's PREVIOUS SVD + a safety margin.
+     * Speedup: (k_old / k_new)³ — exponential in the rank gap.
+     *
+     * Floor: MPS_CHI/4 = 32 to avoid undershooting for sites that
+     * are about to become highly entangled.  The denormal timing
+     * oracle (probe α) ensures we never miss significant σ values.
+     * ─────────────────────────────────────────────────────────── */
+    if (!mps_chi_eff_initialized) {
+        for (int i = 0; i < 4096; i++) mps_chi_eff_prev[i] = MPS_CHI;
+        mps_chi_eff_initialized = 1;
+    }
+    int site_key = (si < 4096) ? si : 0;
+    int chi_prev = mps_chi_eff_prev[site_key];
+    int k_adaptive = chi_prev + 10;
+    if (k_adaptive < MPS_CHI / 4) k_adaptive = MPS_CHI / 4; /* floor */
+    if (k_adaptive > MPS_CHI + 10) k_adaptive = MPS_CHI + 10; /* cap */
+    int k = k_adaptive;
     if (k > DCHI) k = DCHI;
     size_t yk_sz = (size_t)DCHI * k;
     size_t kk_sz = (size_t)k * k;
@@ -819,6 +845,15 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     int chi_eff = 0;
     for (int t = 0; t < MPS_CHI; t++)
         if (sig[t] > 1e-12) chi_eff++;
+
+    /* ── SIDE-CHANNEL η: Update per-site χ_eff for next call ─────
+     * Store this SVD's effective rank so the NEXT SVD at this site
+     * can use an adaptive k.  Add +2 margin for rank growth. */
+    if (site_key < 4096) {
+        int chi_store = chi_eff + 2;
+        if (chi_store > MPS_CHI) chi_store = MPS_CHI;
+        mps_chi_eff_prev[site_key] = chi_store;
+    }
 
     double *u_re = (double *)calloc(vc_sz, sizeof(double));
     double *u_im = (double *)calloc(vc_sz, sizeof(double));
