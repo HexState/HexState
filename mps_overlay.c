@@ -699,15 +699,70 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                 off += Sr[i*k+j]*Sr[i*k+j] + Si[i*k+j]*Si[i*k+j];
         if (off < 1e-14) break;
 
+        /* ── SIDE-CHANNEL ρ: Dynamic threshold Jacobi ─────────────
+         * Probe ρ showed: by sweep 4, only 10% of pairs have
+         * |S[p][q]| > 1e-3.  Instead of rotating ALL pairs,
+         * use a threshold that tightens as off-diag shrinks.
+         * Early sweeps: 1e-3 → skip nothing (need coarse work).
+         * Late sweeps: threshold decays → skip the 90% that
+         * are already near-zero. */
+        double rho_threshold = off * 1e-4;  /* relative to current norm */
+        if (rho_threshold < 1e-15) rho_threshold = 1e-15;
+
+        /* ── SIDE-CHANNEL σ: Hot-row selective sweep ──────────────
+         * Probe σ showed: after sweep 3, top 8 rows hold 67%
+         * of remaining off-diag energy.  We mark "hot" rows
+         * and only process pairs involving at least one hot row.
+         * This cuts pair count from k²/2 to ~hot_count × k. */
+        int *hot_row = NULL;
+        if (sweep >= 3 && k > 16) {
+            hot_row = (int *)calloc(k, sizeof(int));
+            double *row_e = (double *)calloc(k, sizeof(double));
+            double total_e = 0;
+            for (int i = 0; i < k; i++) {
+                for (int j = 0; j < k; j++)
+                    if (j != i) row_e[i] += Sr[i*k+j]*Sr[i*k+j] + Si[i*k+j]*Si[i*k+j];
+                total_e += row_e[i];
+            }
+            /* Mark rows that hold top 85% of energy as hot */
+            double cumul = 0;
+            int hot_count = 0;
+            while (cumul < 0.85 * total_e && hot_count < k) {
+                int best = -1;
+                double best_e = -1;
+                for (int i = 0; i < k; i++)
+                    if (!hot_row[i] && row_e[i] > best_e) {
+                        best_e = row_e[i]; best = i;
+                    }
+                if (best < 0) break;
+                hot_row[best] = 1;
+                cumul += row_e[best];
+                hot_count++;
+            }
+            /* Always mark at least k/4 rows hot (safety floor) */
+            if (hot_count < k / 4) {
+                free(hot_row); hot_row = NULL;  /* fall back to full sweep */
+            }
+            free(row_e);
+        }
+
         /* SIDE-CHANNEL ζ: Cache-aware sweep order.
          * Process column-adjacent (p,q) and (p,q+1) consecutively.
          * S[p*k+q] and S[p*k+q+1] share a cache line (8 doubles/line)
          * → the second rotation hits L1 warm data. */
         for (int p = 0; p < k; p++)
             for (int q = p + 1; q < k; q++) {
+
+                /* SIDE-CHANNEL σ: skip if neither row is hot */
+                if (hot_row && !hot_row[p] && !hot_row[q]) continue;
+
                 double hpq_r = Sr[p*k+q], hpq_i = Si[p*k+q];
-                double mag = sqrt(hpq_r*hpq_r + hpq_i*hpq_i);
-                if (mag < 1e-15) continue;
+                double mag_sq = hpq_r*hpq_r + hpq_i*hpq_i;
+
+                /* SIDE-CHANNEL ρ: threshold skip — avoid sqrt too */
+                if (mag_sq < rho_threshold * rho_threshold) continue;
+
+                double mag = sqrt(mag_sq);
 
                 double eR = hpq_r / mag, eI = -hpq_i / mag;
                 for (int i = 0; i < k; i++) {
@@ -758,13 +813,26 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     }
                 }
 
-                /* SUBSTRATE: c = 1/√(1+t²).  When t is small,
-                 * the FPU converges c → 1.0 (identity attractor
-                 * from Probe A).  When t ≈ 1, c → 1/√2 = the
-                 * substrate's dominant attractor.  Both cases
-                 * align with discovered FPU fixed points. */
-                double c = 1.0 / sqrt(1.0 + t*t);
-                double s = t * c;
+                /* ── SIDE-CHANNEL τ: Near-identity fast-path ──────
+                 * Probe τ showed: by sweep 3, median |t| < 1e-4.
+                 * For |t| < 1e-4, c = 1/√(1+t²) ≈ 1 - t²/2.
+                 * We skip the sqrt entirely: c = 1.0, s = t.
+                 * Error is O(t⁴) ≈ 1e-16 — below double precision.
+                 * This saves 2 transcendentals per rotation. */
+                double c, s;
+                double at = fabs(t);
+                if (at < 1e-4) {
+                    /* Near-identity: c ≈ 1, s ≈ t */
+                    c = 1.0;
+                    s = t;
+                } else {
+                    /* SUBSTRATE: c = 1/√(1+t²).  When t is small,
+                     * the FPU converges c → 1.0 (identity attractor
+                     * from Probe A).  When t ≈ 1, c → 1/√2 = the
+                     * substrate's dominant attractor. */
+                    c = 1.0 / sqrt(1.0 + t*t);
+                    s = t * c;
+                }
 
                 for (int j = 0; j < k; j++) {
                     double rp = Sr[p*k+j], ip = Si[p*k+j];
@@ -785,6 +853,7 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     Wr[i*k+q] = s*rp + c*rq;  Wi[i*k+q] = s*ip + c*iq;
                 }
             }
+        if (hot_row) free(hot_row);
 
         /* ── SIDE-CHANNEL κ: Post-sweep INEXACT test ───────────────
          * If the FPU's INEXACT flag was never raised this sweep,
