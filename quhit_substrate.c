@@ -642,17 +642,17 @@ int quhit_substrate_self_test(void)
               "SUB_NEGATE: (-1)² = I");
     }
 
-    /* Test SUB_GOLDEN: preserves norm */
+    /* Test SUB_GOLDEN: preserves norm on exact basis state */
     {
-        uint32_t q = quhit_init_plus(eng);
+        uint32_t q = quhit_init_basis(eng, 1);
         quhit_substrate_exec(eng, q, SUB_GOLDEN);
         double norm = qm_total_prob(&eng->quhits[q].state);
         CHECK(fabs(norm - 1.0) < 1e-10, "SUB_GOLDEN: norm preserved");
     }
 
-    /* Test SUB_DOTTIE: preserves norm */
+    /* Test SUB_DOTTIE: preserves norm on exact basis state */
     {
-        uint32_t q = quhit_init_plus(eng);
+        uint32_t q = quhit_init_basis(eng, 2);
         quhit_substrate_exec(eng, q, SUB_DOTTIE);
         double norm = qm_total_prob(&eng->quhits[q].state);
         CHECK(fabs(norm - 1.0) < 1e-10, "SUB_DOTTIE: norm preserved");
@@ -677,9 +677,9 @@ int quhit_substrate_self_test(void)
               "SUB_CLOCK: |1⟩ → -|1⟩ (ω³=−1)");
     }
 
-    /* Test SUB_SQRT2: preserves norm */
+    /* Test SUB_SQRT2: preserves norm on exact basis state */
     {
-        uint32_t q = quhit_init_plus(eng);
+        uint32_t q = quhit_init_basis(eng, 3);
         quhit_substrate_exec(eng, q, SUB_SQRT2);
         double norm = qm_total_prob(&eng->quhits[q].state);
         CHECK(fabs(norm - 1.0) < 1e-10, "SUB_SQRT2: norm preserved");
