@@ -116,8 +116,6 @@ For circuits requiring N-body entanglement beyond strict pairwise bonds, the eng
 
 > **Gold Standard**: 105 qudits × 25 cycles (6¹⁰⁵ ≈ **10⁸² Hilbert space dimensions** — more than atoms in the universe) simulated in **6.2 minutes** using **165 MB** on a single machine. S(N/2) = 6.11 ebits (87.3% of max). Full state vector would require 10⁸³ bytes — a **10⁷⁴× compression ratio**.
 
-See [ENTANGLEMENT_EXPERIMENT.md](ENTANGLEMENT_EXPERIMENT.md) and [SUPREMACY_CHALLENGE.md](SUPREMACY_CHALLENGE.md) for the full results.
-
 ---
 
 ## Side-Channel Primitives
