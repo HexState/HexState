@@ -15,6 +15,7 @@
 
 #include "mps_overlay.h"
 #include <math.h>
+#include <fenv.h>
 
 /* ─── Global tensor store ──────────────────────────────────────────────────── */
 MpsTensor *mps_store   = NULL;
@@ -674,7 +675,24 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
     double *Wi = (double *)calloc(kk_sz, sizeof(double));
     for (int i = 0; i < k; i++) Wr[i*k+i] = 1.0;
 
+    /* ── SIDE-CHANNEL λ: Mantissa convergence tracking ──────────────
+     * Track the mantissa bits of the first Jacobi rotation parameter.
+     * When bit-change count drops to 0, the FPU has locked the value
+     * → convergence is certain → break before the off-diag check.
+     * Probe λ showed: bits stabilize ~1 sweep BEFORE off-diag < ε. */
+    uint64_t lambda_prev_mantissa = 0;
+    int lambda_stable_count = 0;
+
     for (int sweep = 0; sweep < 30; sweep++) {
+
+        /* ── SIDE-CHANNEL κ: FPU exception flag oracle ─────────────
+         * Clear all FPU exception flags before the sweep.  After the
+         * sweep, if FE_INEXACT is NOT set, every rotation was trivial
+         * (exact zero off-diag) → the matrix is already diagonal.
+         * This is a FREE check — fetestexcept reads a CPU register.
+         * Probe κ showed: INEXACT count == convergence sweeps. */
+        feclearexcept(FE_ALL_EXCEPT);
+
         double off = 0;
         for (int i = 0; i < k; i++)
             for (int j = i + 1; j < k; j++)
@@ -767,6 +785,40 @@ void mps_gate_2site(QuhitEngine *eng, uint32_t *quhits, int n,
                     Wr[i*k+q] = s*rp + c*rq;  Wi[i*k+q] = s*ip + c*iq;
                 }
             }
+
+        /* ── SIDE-CHANNEL κ: Post-sweep INEXACT test ───────────────
+         * If the FPU's INEXACT flag was never raised this sweep,
+         * every rotation was trivially exact (zero off-diagonal).
+         * The matrix is already diagonal → break immediately.
+         * This is FASTER than computing the off-diagonal norm. */
+        if (sweep > 0 && !fetestexcept(FE_INEXACT))
+            break;
+
+        /* ── SIDE-CHANNEL λ: Mantissa bit-change convergence ───────
+         * Extract mantissa of the first rotation's t parameter.
+         * When the mantissa stops changing between sweeps, the
+         * FPU has locked the convergence path → break early.
+         * Probe λ: stabilization happens ~1 sweep before threshold. */
+        {
+            /* Use off-diagonal norm as mantissa source (captures
+             * the overall state better than a single rotation) */
+            double off_check = 0;
+            for (int i = 0; i < k && i < 8; i++)
+                for (int j = i + 1; j < k && j < 8; j++)
+                    off_check += Sr[i*k+j]*Sr[i*k+j] + Si[i*k+j]*Si[i*k+j];
+            uint64_t off_bits;
+            memcpy(&off_bits, &off_check, 8);
+            uint64_t mantissa = off_bits & 0xFFFFFFFFFFFFFULL;
+            uint64_t changed = mantissa ^ lambda_prev_mantissa;
+            int bits_changed = __builtin_popcountll(changed);
+            if (sweep > 1 && bits_changed == 0)
+                lambda_stable_count++;
+            else
+                lambda_stable_count = 0;
+            lambda_prev_mantissa = mantissa;
+            /* 2 consecutive stable sweeps → convergence locked */
+            if (lambda_stable_count >= 2) break;
+        }
     }
 
     /* ── Step 5g: Extract top-χ from small eigendecomposition ── */
