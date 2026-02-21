@@ -9,7 +9,10 @@ If there is a test folder, it is stable; if there is no test folder it is being 
 Hardware requirements
 </p>
 <p align="center">
-This was developed on a 14th generation i7 CPU with a 33MB + 28MB L2 cache(cache size matters), use this as a reference for V2's hardware requirements. I cannot promise this will work properly on lower-spec CPUs I do not have access to them to test.
+This was developed on a 14th generation i7 CPU with a 33MB + 28MB L2 cache(cache size matters), use this as a reference for V2's hardware requirements. 
+</p>
+<p align="center">
+This utility will NOT function on ARM CPUs, for now.. because they use a somewhat different instruction set. 
 </p>
 
 <p align="center">
